@@ -11,10 +11,11 @@ AC_INIT([libjpeg], [9.1.0])
 AC_CONFIG_AUX_DIR([.])
 
 # Generate configuration headers.
+# NOTE: autoheader automatically modifies the input file of the first
+# invocation of AC_CONFIG_HEADERS, so we give it a dummy invocation so it won't
+# mess with jconfig.cfg.
+AC_CONFIG_HEADERS([config.h])
 AC_CONFIG_HEADERS([jconfig.h:jconfig.cfg])
-
-# Hack: disable autoheader so that it doesn't overwrite our cfg template.
-AUTOHEADER="echo autoheader ignored"
 
 # Check system type
 AC_CANONICAL_TARGET
@@ -26,7 +27,7 @@ AM_INIT_AUTOMAKE([-Wall -Werror no-dist foreign])
 # Make --enable-silent-rules the default.
 # To get verbose build output you may configure
 # with --disable-silent-rules or use "make V=1".
-AM_SILENT_RULES([yes])
+m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 
 # Add configure option --enable-maintainer-mode which enables
 # dependency checking and generation useful to package maintainers.
@@ -40,7 +41,7 @@ AC_PROG_CPP
 AC_PROG_INSTALL
 AC_PROG_MAKE_SET
 AC_PROG_LN_S
-AM_PROG_AR
+m4_ifdef([AM_PROG_AR], [AM_PROG_AR])
 
 # Check if LD supports linker scripts,
 # and define automake conditional HAVE_LD_VERSION_SCRIPT if so.
