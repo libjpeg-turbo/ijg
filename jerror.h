@@ -186,6 +186,7 @@ JMESSAGE(JWRN_MUST_RESYNC,
 	 "Corrupt JPEG data: found marker 0x%02x instead of RST%d")
 JMESSAGE(JWRN_NOT_SEQUENTIAL, "Invalid SOS parameters for sequential JPEG")
 JMESSAGE(JWRN_TOO_MUCH_DATA, "Application transferred too many scanlines")
+JMESSAGE(JERR_BAD_CROP_SPEC, "Invalid crop request")
 JMESSAGE(JERR_BAD_RESTART, "Invalid restart interval %d; must be an integer multiple of the number of MCUs in an MCU row (%d)")
 JMESSAGE(JWRN_MUST_DOWNSCALE,
 	 "Must downscale data from %d bits to %d")
