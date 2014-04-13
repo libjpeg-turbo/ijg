@@ -182,6 +182,7 @@ JMESSAGE(JWRN_MUST_RESYNC,
 	 "Corrupt JPEG data: found marker 0x%02x instead of RST%d")
 JMESSAGE(JWRN_NOT_SEQUENTIAL, "Invalid SOS parameters for sequential JPEG")
 JMESSAGE(JWRN_TOO_MUCH_DATA, "Application transferred too many scanlines")
+JMESSAGE(JERR_BAD_CROP_SPEC, "Invalid crop request")
 
 #ifdef JMAKE_ENUM_LIST
 
