@@ -61,7 +61,7 @@ TESTFILES= testorig.jpg testimg.ppm testimg.bmp testimg.jpg testprog.jpg \
         testimgp.jpg
 
 # libtool libraries to build
-lib_LTLIBRARIES = libjpeg.la
+lib_LTLIBRARIES = libjpeg.la libturbojpeg.la
 
 # Library sources for libjpeg.la
 libjpeg_la_SOURCES = $(LIBSOURCES)
@@ -74,8 +74,26 @@ if HAVE_LD_VERSION_SCRIPT
   libjpeg_la_LDFLAGS += -Wl,--version-script=$(srcdir)/libjpeg.map
 endif
 
+libturbojpeg_la_SOURCES = $(libjpeg_la_SOURCES) turbojpeg.c turbojpeg.h \
+        transupp-tj.c transupp-tj.h jdatadst-tj.c jdatasrc-tj.c
+
+libturbojpeg_la_LDFLAGS = -version-info 0:0 -no-undefined
+
+if HAVE_LD_VERSION_SCRIPT
+  libturbojpeg_la_LDFLAGS += -Wl,--version-script=$(srcdir)/turbojpeg-mapfile
+endif
+
 # Executables to build
-bin_PROGRAMS = cjpeg djpeg jpegtran rdjpgcom wrjpgcom
+bin_PROGRAMS = cjpeg djpeg jpegtran rdjpgcom wrjpgcom tjbench tjunittest
+
+tjbench_SOURCES = tjbench.c bmp.h bmp.c tjutil.h tjutil.c rdbmp.c rdppm.c \
+        wrbmp.c wrppm.c
+
+tjbench_LDADD   = libturbojpeg.la libjpeg.la -lm
+
+tjunittest_SOURCES = tjunittest.c tjutil.h tjutil.c
+
+tjunittest_LDADD = libturbojpeg.la
 
 # Executable sources & libs
 cjpeg_SOURCES    = cjpeg.c rdppm.c rdgif.c rdtarga.c rdrle.c rdbmp.c \
@@ -118,7 +136,9 @@ uninstall-local:
 # Run tests
 test: check-local
 check-local:
-	$(RM) testout*
+	$(RM) testout* test_enc*
+	./tjunittest
+	./tjunittest -alloc
 	./djpeg -dct int -ppm -outfile testout.ppm  $(srcdir)/testorig.jpg
 	./djpeg -dct int -bmp -colors 256 -outfile testout.bmp  $(srcdir)/testorig.jpg
 	./cjpeg -dct int -outfile testout.jpg  $(srcdir)/testimg.ppm
@@ -131,3 +151,6 @@ check-local:
 	cmp $(srcdir)/testimg.ppm testoutp.ppm
 	cmp $(srcdir)/testimgp.jpg testoutp.jpg
 	cmp $(srcdir)/testorig.jpg testoutt.jpg
+
+testclean:
+	$(RM) testout* test_enc*
