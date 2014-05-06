@@ -3,6 +3,8 @@
  *
  * Copyright (C) 1991-1998, Thomas G. Lane.
  * This file is part of the Independent JPEG Group's software.
+ * libjpeg-turbo Modifications:
+ * Copyright (C) 2010, D. R. Commander.
  * For conditions of distribution and use, see the accompanying README file.
  *
  * This file contains a command-line user interface for the JPEG compressor.
@@ -151,6 +153,7 @@ usage (void)
   fprintf(stderr, "Switches (names may be abbreviated):\n");
   fprintf(stderr, "  -quality N     Compression quality (0..100; 5-95 is useful range)\n");
   fprintf(stderr, "  -grayscale     Create monochrome JPEG file\n");
+  fprintf(stderr, "  -rgb           Create RGB JPEG file\n");
 #ifdef ENTROPY_OPT_SUPPORTED
   fprintf(stderr, "  -optimize      Optimize Huffman table (smaller file, but slow compression)\n");
 #endif
@@ -286,6 +289,10 @@ parse_switches (j_compress_ptr cinfo, int argc, char **argv,
     } else if (keymatch(arg, "grayscale", 2) || keymatch(arg, "greyscale",2)) {
       /* Force a monochrome JPEG file to be generated. */
       jpeg_set_colorspace(cinfo, JCS_GRAYSCALE);
+
+    } else if (keymatch(arg, "rgb", 3)) {
+      /* Force an RGB JPEG file to be generated. */
+      jpeg_set_colorspace(cinfo, JCS_RGB);
 
     } else if (keymatch(arg, "maxmemory", 3)) {
       /* Maximum memory in Kb (or Mb with 'm'). */
