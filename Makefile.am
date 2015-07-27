@@ -55,7 +55,7 @@ TESTFILES= testorig.jpg testimg.ppm testimg.bmp testimg.jpg testprog.jpg \
         testimgp.jpg
 
 # libtool libraries to build
-lib_LTLIBRARIES = libjpeg.la libturbojpeg.la
+lib_LTLIBRARIES = libjpeg.la
 
 # Library sources for libjpeg.la
 libjpeg_la_SOURCES = $(LIBSOURCES)
@@ -64,22 +64,8 @@ libjpeg_la_SOURCES = $(LIBSOURCES)
 libjpeg_la_LDFLAGS = -no-undefined \
         -version-info $(JPEG_LIB_VERSION)
 
-libturbojpeg_la_SOURCES = $(libjpeg_la_SOURCES) turbojpeg.c turbojpeg.h \
-        transupp-tj.c transupp-tj.h jdatadst-tj.c jdatasrc-tj.c
-
-libturbojpeg_la_LDFLAGS = -version-info 0:0 -no-undefined
-
 # Executables to build
-bin_PROGRAMS = cjpeg djpeg jpegtran rdjpgcom wrjpgcom tjbench tjunittest
-
-tjbench_SOURCES = tjbench.c bmp.h bmp.c tjutil.h tjutil.c rdbmp.c rdppm.c \
-        wrbmp.c wrppm.c
-
-tjbench_LDADD   = libturbojpeg.la libjpeg.la -lm
-
-tjunittest_SOURCES = tjunittest.c tjutil.h tjutil.c
-
-tjunittest_LDADD = libturbojpeg.la
+bin_PROGRAMS = cjpeg djpeg jpegtran rdjpgcom wrjpgcom
 
 # Executable sources & libs
 cjpeg_SOURCES    = cjpeg.c rdppm.c rdgif.c rdtarga.c rdrle.c rdbmp.c \
