@@ -1,0 +1,16 @@
+.DS_Store
+aclocal.m4
+ansi2knr.c
+ar-lib
+autom4te.cache
+compile
+config.guess
+config.h.in
+config.h.in~
+config.sub
+configure
+depcomp
+install-sh
+ltmain.sh
+Makefile.in
+missing
