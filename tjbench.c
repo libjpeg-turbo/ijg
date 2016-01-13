@@ -1,5 +1,5 @@
 /*
- * Copyright (C)2009-2014 D. R. Commander.  All Rights Reserved.
+ * Copyright (C)2009-2014, 2016 D. R. Commander.  All Rights Reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -47,7 +47,7 @@
 
 enum {YUVENCODE=1, YUVDECODE};
 int flags=TJFLAG_NOREALLOC, decomponly=0, yuv=0, quiet=0, dotile=0,
-	pf=TJPF_BGR;
+	pf=TJPF_BGR, write=1;
 char *ext="ppm";
 const char *pixFormatStr[TJ_NUMPF]=
 {
@@ -168,6 +168,10 @@ int decomptest(unsigned char *srcbuf, unsigned char **jpegbuf,
 		printf("     Dest. throughput:     %f Megapixels/sec\n",
 			(double)(w*h)/1000000.*(double)i/elapsed);
 	}
+
+	if (!write) goto bailout;
+
+
 	if(yuv==YUVDECODE)
 	{
 		snprintf(tempstr, 1024, "%s_%s%s.yuv", filename, subName[subsamp],
@@ -217,7 +221,7 @@ int decomptest(unsigned char *srcbuf, unsigned char **jpegbuf,
 						dstbuf[bindex]=abs(dstbuf[bindex]-y);
 					}
 				}
-			}		
+			}
 			else
 			{
 				for(row=0; row<h; row++)
@@ -417,7 +421,7 @@ void dotest(unsigned char *srcbuf, int w, int h, int subsamp, int jpegqual,
 			printf("     Output bit stream:    %f Megabits/sec\n",
 				(double)totaljpegsize*8./1000000.*(double)i/elapsed);
 		}
-		if(tilew==w && tileh==h)
+		if(tilew==w && tileh==h && write)
 		{
 			snprintf(tempstr, 1024, "%s_%s_Q%d.jpg", filename, subName[subsamp],
 				jpegqual);
@@ -712,7 +716,9 @@ void usage(char *progname)
 	printf("     decompression (these options are mutually exclusive)\n");
 	printf("-grayscale = Perform lossless grayscale conversion prior to decompression\n");
 	printf("     test (can be combined with the other transforms above)\n");
-	printf("-benchtime <t> = Run each benchmark for at least <t> seconds (default = 5.0)\n\n");
+	printf("-benchtime <t> = Run each benchmark for at least <t> seconds (default = 5.0)\n");
+	printf("-nowrite = Do not write reference or output images (improves consistency of\n");
+	printf("     performance measurements.)\n\n");
 	printf("NOTE:  If the quality is specified as a range (e.g. 90-100), a separate\n");
 	printf("test will be performed for all quality values in the range.\n\n");
 	exit(1);
@@ -876,6 +882,7 @@ int main(int argc, char *argv[])
 					}
 				}
 			}
+			if(!strcasecmp(argv[i], "-nowrite")) write=0;
 		}
 	}
 
