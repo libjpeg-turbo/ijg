@@ -1,5 +1,5 @@
 /*
- * Copyright (C)2009-2014, 2016 D. R. Commander.  All Rights Reserved.
+ * Copyright (C)2009-2014, 2016-2017 D. R. Commander.  All Rights Reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -819,6 +819,11 @@ int main(int argc, char *argv[])
 			{
 				printf("Using most accurate DCT/IDCT algorithm\n\n");
 				flags|=TJFLAG_ACCURATEDCT;
+			}
+			if(!strcasecmp(argv[i], "-progressive"))
+			{
+				printf("Using progressive entropy coding\n\n");
+				flags|=TJFLAG_PROGRESSIVE;
 			}
 			if(!strcasecmp(argv[i], "-rgb")) pf=TJPF_RGB;
 			if(!strcasecmp(argv[i], "-rgbx")) pf=TJPF_RGBX;

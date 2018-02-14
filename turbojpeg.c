@@ -1,5 +1,5 @@
 /*
- * Copyright (C)2009-2012, 2014 D. R. Commander.  All Rights Reserved.
+ * Copyright (C)2009-2012, 2014, 2017 D. R. Commander.  All Rights Reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -137,6 +137,7 @@ static int setCompDefaults(struct jpeg_compress_struct *cinfo,
 	int pixelFormat, int subsamp, int jpegQual, int flags)
 {
 	int retval=0;
+	char *env=NULL;
 
 	switch(pixelFormat)
 	{
@@ -187,6 +188,14 @@ static int setCompDefaults(struct jpeg_compress_struct *cinfo,
 		jpeg_set_colorspace(cinfo, JCS_GRAYSCALE);
 	else
 		jpeg_set_colorspace(cinfo, JCS_YCbCr);
+
+	if(flags&TJFLAG_PROGRESSIVE)
+		jpeg_simple_progression(cinfo);
+#ifndef NO_GETENV
+	else if((env=getenv("TJ_PROGRESSIVE"))!=NULL && strlen(env)>0
+		&& !strcmp(env, "1"))
+		jpeg_simple_progression(cinfo);
+#endif
 
 	cinfo->comp_info[0].h_samp_factor=tjMCUWidth[subsamp]/8;
 	cinfo->comp_info[1].h_samp_factor=1;
@@ -1282,6 +1291,8 @@ DLLEXPORT int DLLCALL tjTransform(tjhandle handle, unsigned char *jpegBuf,
 		jpeg_copy_critical_parameters(dinfo, cinfo);
 		dstcoefs=jtransform_adjust_parameters(dinfo, cinfo, srccoefs,
 			&xinfo[i]);
+		if(flags&TJFLAG_PROGRESSIVE || t[i].options&TJXOPT_PROGRESSIVE)
+			jpeg_simple_progression(cinfo);
 		if(!(t[i].options&TJXOPT_NOOUTPUT))
 		{
 			jpeg_write_coefficients(cinfo, dstcoefs);
