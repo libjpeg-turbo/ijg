@@ -136,7 +136,7 @@ static int getPixelFormat(int pixelSize, int flags)
 static int setCompDefaults(struct jpeg_compress_struct *cinfo,
 	int pixelFormat, int subsamp, int jpegQual, int flags)
 {
-	int retval=0;
+	int retval=0, psv=6, pt=0, lossless=0;
 	char *env=NULL;
 
 	switch(pixelFormat)
@@ -197,13 +197,45 @@ static int setCompDefaults(struct jpeg_compress_struct *cinfo,
 		jpeg_simple_progression(cinfo);
 #endif
 
-	cinfo->comp_info[0].h_samp_factor=tjMCUWidth[subsamp]/8;
+	if((env=getenv("TJ_LOSSLESS_PSV"))!=NULL && strlen(env)>0)
+	{
+		int _psv=-1;
+		if(sscanf(env, "%d", &_psv)>=1 && _psv>=1 && _psv<=7)
+		{
+			psv=_psv;
+			lossless=1;
+		}
+	}
+	if((env=getenv("TJ_LOSSLESS_PT"))!=NULL && strlen(env)>0)
+	{
+		int _pt=-1;
+		if(sscanf(env, "%d", &_pt)>=1 && _pt>=0)
+		{
+			pt=_pt;
+			lossless=1;
+		}
+	}
+	if((env=getenv("TJ_LOSSLESS"))!=NULL && strlen(env)>0 && !strcmp(env, "1"))
+		lossless=1;
+	if(lossless)
+	{
+		if(pixelFormat!=TJPF_RGB && pixelFormat!=TJPF_GRAY)
+			_throw("Pixel format must be RGB or grayscale when creating a lossless JPEG image.");
+		if(pixelFormat!=TJPF_GRAY && subsamp==TJSAMP_GRAY)
+			_throw("RGB-to-grayscale conversion not supported when creating a lossless JPEG image.");
+		if(subsamp!=TJSAMP_GRAY)
+			jpeg_set_colorspace(cinfo, JCS_RGB);
+		jpeg_enable_lossless(cinfo, psv, pt);
+	}
+
+	cinfo->comp_info[0].h_samp_factor=lossless? 1:tjMCUWidth[subsamp]/8;
 	cinfo->comp_info[1].h_samp_factor=1;
 	cinfo->comp_info[2].h_samp_factor=1;
-	cinfo->comp_info[0].v_samp_factor=tjMCUHeight[subsamp]/8;
+	cinfo->comp_info[0].v_samp_factor=lossless? 1:tjMCUHeight[subsamp]/8;
 	cinfo->comp_info[1].v_samp_factor=1;
 	cinfo->comp_info[2].v_samp_factor=1;
 
+	bailout:
 	return retval;
 }
 
