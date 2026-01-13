@@ -1,5 +1,6 @@
 /*
- * Copyright (C)2009-2019, 2021-2024 D. R. Commander.  All Rights Reserved.
+ * Copyright (C)2009-2019, 2021-2024, 2026 D. R. Commander.
+ *                                         All Rights Reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -85,8 +86,11 @@ static int tjErrorLine = -1, tjErrorCode = -1;
   } \
 }
 
-static int flags = TJFLAG_NOREALLOC, compOnly = 0, decompOnly = 0, doYUV = 0,
-  quiet = 0, doTile = 0, pf = TJPF_BGR, yuvAlign = 1, doWrite = 1;
+static int flags = TJFLAG_NOREALLOC, compOnly = 0, decompOnly = 0,
+  quiet = 0, doTile = 0, pf = TJPF_BGR, doWrite = 1;
+#if BITS_IN_JSAMPLE == 8
+static int doYUV = 0, yuvAlign = 1;
+#endif
 static char *ext = "ppm";
 static const char *pixFormatStr[TJ_NUMPF] = {
   "RGB", "BGR", "RGBX", "BGRX", "XBGR", "XRGB", "GRAY", "", "", "", "", "CMYK"
@@ -146,8 +150,8 @@ static int dummyDCTFilter(short *coeffs, tjregion arrayRegion,
 
 
 /* Decompression test */
-static int decomp(unsigned char *srcBuf, unsigned char **jpegBuf,
-                  unsigned long *jpegSize, unsigned char *dstBuf, int w, int h,
+static int decomp(JSAMPLE *srcBuf, unsigned char **jpegBuf,
+                  unsigned long *jpegSize, JSAMPLE *dstBuf, int w, int h,
                   int subsamp, int jpegQual, char *fileName, int tilew,
                   int tileh)
 {
@@ -161,7 +165,10 @@ static int decomp(unsigned char *srcBuf, unsigned char **jpegBuf,
   int scaledh = TJSCALED(h, sf);
   int pitch = scaledw * ps;
   int ntilesw = (w + tilew - 1) / tilew, ntilesh = (h + tileh - 1) / tileh;
-  unsigned char *dstPtr, *dstPtr2, *yuvBuf = NULL;
+  JSAMPLE *dstPtr, *dstPtr2;
+#if BITS_IN_JSAMPLE == 8
+  unsigned char *yuvBuf = NULL;
+#endif
 
   if (jpegQual > 0) {
     SNPRINTF(qualStr, 13, "_Q%d", jpegQual);
@@ -173,11 +180,11 @@ static int decomp(unsigned char *srcBuf, unsigned char **jpegBuf,
 
   if (dstBuf == NULL) {
 #if ULLONG_MAX > SIZE_MAX
-    if ((unsigned long long)pitch * (unsigned long long)scaledh >
+    if ((unsigned long long)pitch * (unsigned long long)scaledh * sizeof(JSAMPLE) >
         (unsigned long long)((size_t)-1))
       THROW("allocating destination buffer", "Image is too large");
 #endif
-    if ((dstBuf = (unsigned char *)malloc((size_t)pitch * scaledh)) == NULL)
+    if ((dstBuf = (JSAMPLE *)malloc((size_t)pitch * scaledh * sizeof(JSAMPLE))) == NULL)
       THROW_UNIX("allocating destination buffer");
     dstBufAlloc = 1;
   }
@@ -185,6 +192,7 @@ static int decomp(unsigned char *srcBuf, unsigned char **jpegBuf,
      attempted to write to it */
   memset(dstBuf, 127, (size_t)pitch * scaledh);
 
+#if BITS_IN_JSAMPLE == 8
   if (doYUV) {
     int width = doTile ? tilew : scaledw;
     int height = doTile ? tileh : scaledh;
@@ -196,6 +204,7 @@ static int decomp(unsigned char *srcBuf, unsigned char **jpegBuf,
       THROW_UNIX("allocating YUV buffer");
     memset(yuvBuf, 127, yuvSize);
   }
+#endif
 
   /* Benchmark */
   iter = -1;
@@ -211,6 +220,7 @@ static int decomp(unsigned char *srcBuf, unsigned char **jpegBuf,
         int width = doTile ? min(tilew, w - col * tilew) : scaledw;
         int height = doTile ? min(tileh, h - row * tileh) : scaledh;
 
+#if BITS_IN_JSAMPLE == 8
         if (doYUV) {
           double startDecode;
 
@@ -222,9 +232,11 @@ static int decomp(unsigned char *srcBuf, unsigned char **jpegBuf,
                           pitch, height, pf, flags) == -1)
             THROW_TJ("executing tjDecodeYUV()");
           if (iter >= 0) elapsedDecode += getTime() - startDecode;
-        } else if (tjDecompress2(handle, jpegBuf[tile], jpegSize[tile],
-                                 dstPtr2, width, pitch, height, pf,
-                                 flags) == -1)
+        } else
+#endif
+        if (tjDecompress2(handle, jpegBuf[tile], jpegSize[tile],
+                          dstPtr2, width, pitch, height, pf,
+                          flags) == -1)
           THROW_TJ("executing tjDecompress2()");
       }
     }
@@ -237,7 +249,9 @@ static int decomp(unsigned char *srcBuf, unsigned char **jpegBuf,
       elapsed = elapsedDecode = 0.;
     }
   }
+#if BITS_IN_JSAMPLE == 8
   if (doYUV) elapsed -= elapsedDecode;
+#endif
 
   if (tjDestroy(handle) == -1) THROW_TJ("executing tjDestroy()");
   handle = NULL;
@@ -247,22 +261,30 @@ static int decomp(unsigned char *srcBuf, unsigned char **jpegBuf,
            sigfig((double)(w * h) / 1000000. * (double)iter / elapsed, 4,
                   tempStr, 1024),
            quiet == 2 ? "\n" : "  ");
+#if BITS_IN_JSAMPLE == 8
     if (doYUV)
       printf("%s\n",
              sigfig((double)(w * h) / 1000000. * (double)iter / elapsedDecode,
                     4, tempStr, 1024));
-    else if (quiet != 2) printf("\n");
+    else
+#endif
+    if (quiet != 2) printf("\n");
   } else {
     printf("%s --> Frame rate:         %f fps\n",
-           doYUV ? "Decomp to YUV" : "Decompress   ", (double)iter / elapsed);
+#if BITS_IN_JSAMPLE == 8
+           doYUV ? "Decomp to YUV" :
+#endif
+           "Decompress   ", (double)iter / elapsed);
     printf("                  Throughput:         %f Megapixels/sec\n",
            (double)(w * h) / 1000000. * (double)iter / elapsed);
+#if BITS_IN_JSAMPLE == 8
     if (doYUV) {
       printf("YUV Decode    --> Frame rate:         %f fps\n",
              (double)iter / elapsedDecode);
       printf("                  Throughput:         %f Megapixels/sec\n",
              (double)(w * h) / 1000000. * (double)iter / elapsedDecode);
     }
+#endif
   }
 
   if (!doWrite) goto bailout;
@@ -296,19 +318,19 @@ static int decomp(unsigned char *srcBuf, unsigned char **jpegBuf,
                         (double)srcBuf[gindex] * 0.587 +
                         (double)srcBuf[bindex] * 0.114 + 0.5);
 
-          if (y > 255) y = 255;
+          if (y > MAXJSAMPLE) y = MAXJSAMPLE;
           if (y < 0) y = 0;
-          dstBuf[rindex] = (unsigned char)abs(dstBuf[rindex] - y);
-          dstBuf[gindex] = (unsigned char)abs(dstBuf[gindex] - y);
-          dstBuf[bindex] = (unsigned char)abs(dstBuf[bindex] - y);
+          dstBuf[rindex] = (JSAMPLE)abs(dstBuf[rindex] - y);
+          dstBuf[gindex] = (JSAMPLE)abs(dstBuf[gindex] - y);
+          dstBuf[bindex] = (JSAMPLE)abs(dstBuf[bindex] - y);
         }
       }
     } else {
       for (row = 0; row < h; row++)
         for (col = 0; col < w * ps; col++)
           dstBuf[pitch * row + col] =
-            (unsigned char)abs(dstBuf[pitch * row + col] -
-                               srcBuf[pitch * row + col]);
+            (JSAMPLE)abs(dstBuf[pitch * row + col] -
+                         srcBuf[pitch * row + col]);
     }
     if (tjSaveImage(tempStr, dstBuf, w, 0, h, pf, flags) == -1)
       THROW_TJG("saving output image");
@@ -318,33 +340,38 @@ bailout:
   if (file) fclose(file);
   if (handle) tjDestroy(handle);
   if (dstBufAlloc) free(dstBuf);
+#if BITS_IN_JSAMPLE == 8
   free(yuvBuf);
+#endif
   return retval;
 }
 
 
-static int fullTest(unsigned char *srcBuf, int w, int h, int subsamp,
+static int fullTest(JSAMPLE *srcBuf, int w, int h, int subsamp,
                     int jpegQual, char *fileName)
 {
   char tempStr[1024], tempStr2[80];
   FILE *file = NULL;
   tjhandle handle = NULL;
-  unsigned char **jpegBuf = NULL, *yuvBuf = NULL, *tmpBuf = NULL, *srcPtr,
-    *srcPtr2;
+  unsigned char **jpegBuf = NULL, *yuvBuf = NULL;
+  JSAMPLE *tmpBuf = NULL, *srcPtr, *srcPtr2;
   double start, elapsed, elapsedEncode;
   int totalJpegSize = 0, row, col, i, tilew = w, tileh = h, retval = 0;
   int iter;
-  unsigned long *jpegSize = NULL, yuvSize = 0;
+  unsigned long *jpegSize = NULL;
+#if BITS_IN_JSAMPLE == 8
+  unsigned long yuvSize = 0;
+#endif
   int ps = tjPixelSize[pf];
   int ntilesw = 1, ntilesh = 1, pitch = w * ps;
   const char *pfStr = pixFormatStr[pf];
 
 #if ULLONG_MAX > SIZE_MAX
-  if ((unsigned long long)pitch * (unsigned long long)h >
+  if ((unsigned long long)pitch * (unsigned long long)h * sizeof(JSAMPLE) >
       (unsigned long long)((size_t)-1))
     THROW("allocating temporary image buffer", "Image is too large");
 #endif
-  if ((tmpBuf = (unsigned char *)malloc((size_t)pitch * h)) == NULL)
+  if ((tmpBuf = (JSAMPLE *)malloc((size_t)pitch * h * sizeof(JSAMPLE))) == NULL)
     THROW_UNIX("allocating temporary image buffer");
 
   if (!quiet)
@@ -387,6 +414,7 @@ static int fullTest(unsigned char *srcBuf, int w, int h, int subsamp,
     if ((handle = tjInitCompress()) == NULL)
       THROW_TJ("executing tjInitCompress()");
 
+#if BITS_IN_JSAMPLE == 8
     if (doYUV) {
       yuvSize = tjBufSizeYUV2(tilew, yuvAlign, tileh, subsamp);
       if (yuvSize == (unsigned long)-1)
@@ -395,6 +423,7 @@ static int fullTest(unsigned char *srcBuf, int w, int h, int subsamp,
         THROW_UNIX("allocating YUV buffer");
       memset(yuvBuf, 127, yuvSize);
     }
+#endif
 
     /* Benchmark */
     iter = -1;
@@ -411,6 +440,7 @@ static int fullTest(unsigned char *srcBuf, int w, int h, int subsamp,
           int width = min(tilew, w - col * tilew);
           int height = min(tileh, h - row * tileh);
 
+#if BITS_IN_JSAMPLE == 8
           if (doYUV) {
             double startEncode = getTime();
 
@@ -422,7 +452,9 @@ static int fullTest(unsigned char *srcBuf, int w, int h, int subsamp,
                                   subsamp, &jpegBuf[tile], &jpegSize[tile],
                                   jpegQual, flags) == -1)
               THROW_TJ("executing tjCompressFromYUV()");
-          } else {
+          } else
+#endif
+          {
             if (tjCompress2(handle, srcPtr2, width, pitch, height, pf,
                             &jpegBuf[tile], &jpegSize[tile], subsamp, jpegQual,
                             flags) == -1)
@@ -440,18 +472,22 @@ static int fullTest(unsigned char *srcBuf, int w, int h, int subsamp,
         elapsed = elapsedEncode = 0.;
       }
     }
+#if BITS_IN_JSAMPLE == 8
     if (doYUV) elapsed -= elapsedEncode;
+#endif
 
     if (tjDestroy(handle) == -1) THROW_TJ("executing tjDestroy()");
     handle = NULL;
 
     if (quiet == 1) printf("%-5d  %-5d   ", tilew, tileh);
     if (quiet) {
+#if BITS_IN_JSAMPLE == 8
       if (doYUV)
         printf("%-6s%s",
                sigfig((double)(w * h) / 1000000. *
                       (double)iter / elapsedEncode, 4, tempStr, 1024),
                quiet == 2 ? "\n" : "  ");
+#endif
       printf("%-6s%s",
              sigfig((double)(w * h) / 1000000. * (double)iter / elapsed, 4,
                     tempStr, 1024),
@@ -462,6 +498,7 @@ static int fullTest(unsigned char *srcBuf, int w, int h, int subsamp,
              quiet == 2 ? "\n" : "  ");
     } else {
       printf("\n%s size: %d x %d\n", doTile ? "Tile" : "Image", tilew, tileh);
+#if BITS_IN_JSAMPLE == 8
       if (doYUV) {
         printf("Encode YUV    --> Frame rate:         %f fps\n",
                (double)iter / elapsedEncode);
@@ -473,8 +510,12 @@ static int fullTest(unsigned char *srcBuf, int w, int h, int subsamp,
         printf("                  Output bit stream:  %f Megabits/sec\n",
                (double)yuvSize * 8. / 1000000. * (double)iter / elapsedEncode);
       }
+#endif
       printf("%s --> Frame rate:         %f fps\n",
-             doYUV ? "Comp from YUV" : "Compress     ",
+#if BITS_IN_JSAMPLE == 8
+             doYUV ? "Comp from YUV" :
+#endif
+             "Compress     ",
              (double)iter / elapsed);
       printf("                  Output image size:  %d bytes\n",
              totalJpegSize);
@@ -509,9 +550,11 @@ static int fullTest(unsigned char *srcBuf, int w, int h, int subsamp,
     }
     free(jpegBuf);  jpegBuf = NULL;
     free(jpegSize);  jpegSize = NULL;
+#if BITS_IN_JSAMPLE == 8
     if (doYUV) {
       free(yuvBuf);  yuvBuf = NULL;
     }
+#endif
 
     if (tilew == w && tileh == h) break;
   }
@@ -578,10 +621,14 @@ static int decompTest(char *fileName)
     printf("All performance values in Mpixels/sec\n\n");
     printf("Pixel      JPEG   JPEG     %s  %s   Xform   Comp    Decomp  ",
            doTile ? "Tile " : "Image", doTile ? "Tile " : "Image");
+#if BITS_IN_JSAMPLE == 8
     if (doYUV) printf("Decode");
+#endif
     printf("\n");
     printf("Format     CS     Subsamp  Width  Height  Perf    Ratio   Perf    ");
+#if BITS_IN_JSAMPLE == 8
     if (doYUV) printf("Perf");
+#endif
     printf("\n\n");
   } else if (!quiet)
     printf(">>>>>  JPEG %s --> %s (%s)  <<<<<\n",
@@ -785,10 +832,12 @@ static void usage(char *progName)
   printf("     subsampling (<s> = 444, 422, 440, 420, 411, or GRAY) [default = test\n");
   printf("     Grayscale, 4:2:0, 4:2:2, and 4:4:4 in sequence]\n");
   printf("-quiet = Output results in tabular rather than verbose format\n");
+#if BITS_IN_JSAMPLE == 8
   printf("-yuv = Compress from/decompress to intermediate planar YUV images\n");
   printf("-yuvpad <p> = The number of bytes by which each row in each plane of an\n");
   printf("     intermediate YUV image is evenly divisible (must be a power of 2)\n");
   printf("     [default = 1]\n");
+#endif
   printf("-scale M/N = When decompressing, scale the width/height of the JPEG image by a\n");
   printf("     factor of M/N (M/N = ");
   for (i = 0; i < nsf; i++) {
@@ -828,7 +877,7 @@ static void usage(char *progName)
 
 int main(int argc, char *argv[])
 {
-  unsigned char *srcBuf = NULL;
+  JSAMPLE *srcBuf = NULL;
   int w = 0, h = 0, i, j, minQual = -1, maxQual = -1;
   char *temp;
   int minArg = 2, retval = 0, subsamp = -1;
@@ -948,6 +997,7 @@ int main(int argc, char *argv[])
         flags &= (~TJFLAG_NOREALLOC);
       else if (!strcasecmp(argv[i], "-bmp"))
         ext = "bmp";
+#if BITS_IN_JSAMPLE == 8
       else if (!strcasecmp(argv[i], "-yuv")) {
         printf("Testing planar YUV encoding/decoding\n\n");
         doYUV = 1;
@@ -956,7 +1006,9 @@ int main(int argc, char *argv[])
 
         if (tempi >= 1 && (tempi & (tempi - 1)) == 0) yuvAlign = tempi;
         else usage(argv[0]);
-      } else if (!strcasecmp(argv[i], "-subsamp") && i < argc - 1) {
+      }
+#endif
+      else if (!strcasecmp(argv[i], "-subsamp") && i < argc - 1) {
         i++;
         if (toupper(argv[i][0]) == 'G') subsamp = TJSAMP_GRAY;
         else {
@@ -1006,14 +1058,22 @@ int main(int argc, char *argv[])
     printf("All performance values in Mpixels/sec\n\n");
     printf("Pixel      JPEG     JPEG  %s  %s   ",
            doTile ? "Tile " : "Image", doTile ? "Tile " : "Image");
+#if BITS_IN_JSAMPLE == 8
     if (doYUV) printf("Encode  ");
+#endif
     printf("Comp    Comp    Decomp  ");
+#if BITS_IN_JSAMPLE == 8
     if (doYUV) printf("Decode");
+#endif
     printf("\n");
     printf("Format     Subsamp  Qual  Width  Height  ");
+#if BITS_IN_JSAMPLE == 8
     if (doYUV) printf("Perf    ");
+#endif
     printf("Perf    Ratio   Perf    ");
+#if BITS_IN_JSAMPLE == 8
     if (doYUV) printf("Perf");
+#endif
     printf("\n\n");
   }
 
@@ -1044,6 +1104,6 @@ int main(int argc, char *argv[])
   }
 
 bailout:
-  tjFree(srcBuf);
+  tjFree((unsigned char *)srcBuf);
   return retval;
 }
