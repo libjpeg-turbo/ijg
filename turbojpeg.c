@@ -472,13 +472,13 @@ static int getSubsamp(j_decompress_ptr dinfo)
 /* Conversion functions to emulate the colorspace extensions.  This allows the
    TurboJPEG API to be used with libjpeg. */
 
-static INLINE unsigned char *toRGB(unsigned char *src, int width, int pitch,
-                                   int height, int srcPixelFormat,
-                                   unsigned char *dst, int dstRedOffset,
-                                   int dstGreenOffset, int dstBlueOffset,
-                                   int dstPixelSize)
+static INLINE JSAMPLE *toRGB(JSAMPLE *src, int width, int pitch,
+                             int height, int srcPixelFormat,
+                             JSAMPLE *dst, int dstRedOffset,
+                             int dstGreenOffset, int dstBlueOffset,
+                             int dstPixelSize)
 {
-  unsigned char *retval = src;
+  JSAMPLE *retval = src;
   int srcRedOffset = tjRedOffset[srcPixelFormat];
   int srcGreenOffset = tjGreenOffset[srcPixelFormat];
   int srcBlueOffset = tjBlueOffset[srcPixelFormat];
@@ -491,7 +491,7 @@ static INLINE unsigned char *toRGB(unsigned char *src, int width, int pitch,
     retval = dst;
 
     while (height--) {
-      unsigned char *endOfRow = src + width * srcPixelSize;
+      JSAMPLE *endOfRow = src + width * srcPixelSize;
 
       while (src < endOfRow) {
         dst[dstRedOffset] = src[srcRedOffset];
@@ -506,9 +506,9 @@ static INLINE unsigned char *toRGB(unsigned char *src, int width, int pitch,
   return retval;
 }
 
-static INLINE void fromRGB(unsigned char *src, int srcRedOffset,
+static INLINE void fromRGB(JSAMPLE *src, int srcRedOffset,
                            int srcGreenOffset, int srcBlueOffset,
-                           int srcPixelSize, unsigned char *dst, int width,
+                           int srcPixelSize, JSAMPLE *dst, int width,
                            int pitch, int height, int dstPixelFormat)
 {
   int dstRedOffset = tjRedOffset[dstPixelFormat];
@@ -523,14 +523,14 @@ static INLINE void fromRGB(unsigned char *src, int srcRedOffset,
     int rowPad = pitch - width * dstPixelSize;
 
     while (height--) {
-      unsigned char *endOfRow = dst + width * dstPixelSize;
+      JSAMPLE *endOfRow = dst + width * dstPixelSize;
 
       while (dst < endOfRow) {
         dst[dstRedOffset] = src[srcRedOffset];
         dst[dstGreenOffset] = src[srcGreenOffset];
         dst[dstBlueOffset] = src[srcBlueOffset];
         if (dstAlphaOffset >= 0)
-          dst[dstAlphaOffset] = 0xFF;
+          dst[dstAlphaOffset] = MAXJSAMPLE;
         dst += dstPixelSize;  src += srcPixelSize;
       }
       dst += rowPad;
@@ -699,6 +699,8 @@ bailout:
 }
 
 
+#if BITS_IN_JSAMPLE == 8
+
 /* TurboJPEG 1.4+ */
 DLLEXPORT unsigned long tjBufSizeYUV2(int width, int align, int height,
                                       int subsamp)
@@ -819,9 +821,11 @@ bailout:
   return (unsigned long)retval;
 }
 
+#endif
+
 
 /* TurboJPEG 1.2+ */
-DLLEXPORT int tjCompress2(tjhandle handle, const unsigned char *srcBuf,
+DLLEXPORT int tjCompress2(tjhandle handle, const JSAMPLE *srcBuf,
                           int width, int pitch, int height, int pixelFormat,
                           unsigned char **jpegBuf, unsigned long *jpegSize,
                           int jpegSubsamp, int jpegQual, int flags)
@@ -830,7 +834,7 @@ DLLEXPORT int tjCompress2(tjhandle handle, const unsigned char *srcBuf,
   boolean alloc = TRUE;
   JSAMPROW *row_pointer = NULL;
 #ifndef JCS_EXTENSIONS
-  unsigned char *rgbBuf = NULL;
+  JSAMPLE *rgbBuf = NULL;
 #endif
 
   GET_CINSTANCE(handle)
@@ -875,9 +879,9 @@ DLLEXPORT int tjCompress2(tjhandle handle, const unsigned char *srcBuf,
        tjGreenOffset[pixelFormat] != RGB_GREEN ||
        tjBlueOffset[pixelFormat] != RGB_BLUE ||
        tjPixelSize[pixelFormat] != RGB_PIXELSIZE)) {
-    rgbBuf = (unsigned char *)malloc(width * height * RGB_PIXELSIZE);
+    rgbBuf = (JSAMPLE *)malloc(width * height * RGB_PIXELSIZE * sizeof(JSAMPLE));
     if (!rgbBuf) THROW("tjCompress2(): Memory allocation failure");
-    srcBuf = toRGB((unsigned char *)srcBuf, width, pitch, height, pixelFormat,
+    srcBuf = toRGB((JSAMPLE *)srcBuf, width, pitch, height, pixelFormat,
                    rgbBuf, RGB_RED, RGB_GREEN, RGB_BLUE, RGB_PIXELSIZE);
     pitch = width * RGB_PIXELSIZE;
     cinfo->in_color_space = JCS_RGB;
@@ -912,7 +916,7 @@ bailout:
 }
 
 /* TurboJPEG 1.0+ */
-DLLEXPORT int tjCompress(tjhandle handle, unsigned char *srcBuf, int width,
+DLLEXPORT int tjCompress(tjhandle handle, JSAMPLE *srcBuf, int width,
                          int pitch, int height, int pixelSize,
                          unsigned char *jpegBuf, unsigned long *jpegSize,
                          int jpegSubsamp, int jpegQual, int flags)
@@ -920,12 +924,15 @@ DLLEXPORT int tjCompress(tjhandle handle, unsigned char *srcBuf, int width,
   int retval = 0;
   unsigned long size;
 
+#if BITS_IN_JSAMPLE == 8
   if (flags & TJ_YUV) {
     size = tjBufSizeYUV(width, height, jpegSubsamp);
     retval = tjEncodeYUV2(handle, srcBuf, width, pitch, height,
                           getPixelFormat(pixelSize, flags), jpegBuf,
                           jpegSubsamp, flags);
-  } else {
+  } else
+#endif
+  {
     retval = tjCompress2(handle, srcBuf, width, pitch, height,
                          getPixelFormat(pixelSize, flags), &jpegBuf, &size,
                          jpegSubsamp, jpegQual, flags | TJFLAG_NOREALLOC);
@@ -934,6 +941,8 @@ DLLEXPORT int tjCompress(tjhandle handle, unsigned char *srcBuf, int width,
   return retval;
 }
 
+
+#if BITS_IN_JSAMPLE == 8
 
 /* TurboJPEG 1.4+ */
 DLLEXPORT int tjEncodeYUVPlanes(tjhandle handle, const unsigned char *srcBuf,
@@ -1366,6 +1375,8 @@ bailout:
   return retval;
 }
 
+#endif
+
 
 /******************************* Decompressor ********************************/
 
@@ -1509,7 +1520,7 @@ DLLEXPORT tjscalingfactor *tjGetScalingFactors(int *numScalingFactors)
 
 /* TurboJPEG 1.2+ */
 DLLEXPORT int tjDecompress2(tjhandle handle, const unsigned char *jpegBuf,
-                            unsigned long jpegSize, unsigned char *dstBuf,
+                            unsigned long jpegSize, JSAMPLE *dstBuf,
                             int width, int pitch, int height, int pixelFormat,
                             int flags)
 {
@@ -1517,7 +1528,7 @@ DLLEXPORT int tjDecompress2(tjhandle handle, const unsigned char *jpegBuf,
   int i, retval = 0, jpegwidth, jpegheight, scaledw, scaledh;
   struct my_progress_mgr progress;
 #ifndef JCS_EXTENSIONS
-  unsigned char *rgbBuf = NULL, *_dstBuf = NULL;
+  JSAMPLE *rgbBuf = NULL, *_dstBuf = NULL;
   int _pitch = 0;
 #endif
 
@@ -1580,7 +1591,7 @@ DLLEXPORT int tjDecompress2(tjhandle handle, const unsigned char *jpegBuf,
        tjBlueOffset[pixelFormat] != RGB_BLUE ||
        tjPixelSize[pixelFormat] != RGB_PIXELSIZE ||
        (pixelFormat >= TJPF_RGBA && pixelFormat <= TJPF_ARGB))) {
-    rgbBuf = (unsigned char *)malloc(width * height * RGB_PIXELSIZE);
+    rgbBuf = (JSAMPLE *)malloc(width * height * RGB_PIXELSIZE * sizeof(JSAMPLE));
     if (!rgbBuf) THROW("tjDecompress2(): Memory allocation failure")
     _pitch = pitch;  pitch = width * RGB_PIXELSIZE;
     _dstBuf = dstBuf;  dstBuf = rgbBuf;
@@ -1625,17 +1636,21 @@ bailout:
 
 /* TurboJPEG 1.0+ */
 DLLEXPORT int tjDecompress(tjhandle handle, unsigned char *jpegBuf,
-                           unsigned long jpegSize, unsigned char *dstBuf,
+                           unsigned long jpegSize, JSAMPLE *dstBuf,
                            int width, int pitch, int height, int pixelSize,
                            int flags)
 {
+#if BITS_IN_JSAMPLE == 8
   if (flags & TJ_YUV)
     return tjDecompressToYUV(handle, jpegBuf, jpegSize, dstBuf, flags);
   else
+#endif
     return tjDecompress2(handle, jpegBuf, jpegSize, dstBuf, width, pitch,
                          height, getPixelFormat(pixelSize, flags), flags);
 }
 
+
+#if BITS_IN_JSAMPLE == 8
 
 static void setDecodeDefaults(struct jpeg_decompress_struct *dinfo,
                               int pixelFormat, int subsamp, int flags)
@@ -2168,6 +2183,8 @@ DLLEXPORT int tjDecompressToYUV(tjhandle handle, unsigned char *jpegBuf,
   return tjDecompressToYUV2(handle, jpegBuf, jpegSize, dstBuf, 0, 4, 0, flags);
 }
 
+#endif
+
 
 /******************************** Transformer ********************************/
 
@@ -2390,9 +2407,9 @@ bailout:
 /*************************** Packed-Pixel Image I/O **************************/
 
 /* TurboJPEG 2.0+ */
-DLLEXPORT unsigned char *tjLoadImage(const char *filename, int *width,
-                                     int align, int *height, int *pixelFormat,
-                                     int flags)
+DLLEXPORT JSAMPLE *tjLoadImage(const char *filename, int *width,
+                               int align, int *height, int *pixelFormat,
+                               int flags)
 {
   int retval = 0, tempc;
   size_t pitch;
@@ -2400,11 +2417,11 @@ DLLEXPORT unsigned char *tjLoadImage(const char *filename, int *width,
   tjinstance *this;
   j_compress_ptr cinfo = NULL;
   cjpeg_source_ptr src;
-  unsigned char *dstBuf = NULL;
+  JSAMPLE *dstBuf = NULL;
   FILE *file = NULL;
   boolean invert;
 #ifndef JCS_EXTENSIONS
-  unsigned char *rgbBuf = NULL, *_dstBuf = NULL;
+  JSAMPLE *rgbBuf = NULL, *_dstBuf = NULL;
   int _pitch = 0;
 #endif
 
@@ -2443,6 +2460,7 @@ DLLEXPORT unsigned char *tjLoadImage(const char *filename, int *width,
   if (*pixelFormat == TJPF_UNKNOWN) cinfo->in_color_space = JCS_UNKNOWN;
   else cinfo->in_color_space = pf2cs[*pixelFormat];
   if (tempc == 'B') {
+#if BITS_IN_JSAMPLE == 8
 #ifdef LIBJPEG_TURBO_VERSION
     if ((src = jinit_read_bmp(cinfo, FALSE)) == NULL)
       THROWG("tjLoadImage(): Could not initialize bitmap loader");
@@ -2453,6 +2471,9 @@ DLLEXPORT unsigned char *tjLoadImage(const char *filename, int *width,
     if ((src = jinit_read_bmp(cinfo)) == NULL)
       THROWG("tjLoadImage(): Could not initialize bitmap loader");
     invert = (flags & TJFLAG_BOTTOMUP) != 0;
+#endif
+#else
+    THROWG("tjLoadImage(): BMP files require 8-bit data precision");
 #endif
   } else if (tempc == 'P') {
     if ((src = jinit_read_ppm(cinfo)) == NULL)
@@ -2484,10 +2505,10 @@ DLLEXPORT unsigned char *tjLoadImage(const char *filename, int *width,
   pitch = PAD((*width) * tjPixelSize[*pixelFormat], align);
   if (
 #if ULLONG_MAX > SIZE_MAX
-      (unsigned long long)pitch * (unsigned long long)(*height) >
+      (unsigned long long)pitch * (unsigned long long)(*height) * sizeof(JSAMPLE) >
       (unsigned long long)((size_t)-1) ||
 #endif
-      (dstBuf = (unsigned char *)malloc(pitch * (*height))) == NULL)
+      (dstBuf = (JSAMPLE *)malloc(pitch * (*height) * sizeof(JSAMPLE))) == NULL)
     THROWG("tjLoadImage(): Memory allocation failure");
 
   if (setjmp(this->jerr.setjmp_buffer)) {
@@ -2499,7 +2520,7 @@ DLLEXPORT unsigned char *tjLoadImage(const char *filename, int *width,
   if (*pixelFormat != TJPF_GRAY && *pixelFormat != TJPF_CMYK &&
       (tjRedOffset[*pixelFormat] != 0 || tjGreenOffset[*pixelFormat] != 1 ||
        tjBlueOffset[*pixelFormat] != 2 || tjPixelSize[*pixelFormat] != 3)) {
-    rgbBuf = (unsigned char *)malloc((*width) * (*height) * 3);
+    rgbBuf = (JSAMPLE *)malloc((*width) * (*height) * 3 * sizeof(JSAMPLE));
     if (!rgbBuf) THROW("tjLoadImage(): Memory allocation failure")
     _pitch = pitch;  pitch = (*width) * 3;
     _dstBuf = dstBuf;  dstBuf = rgbBuf;
@@ -2510,7 +2531,7 @@ DLLEXPORT unsigned char *tjLoadImage(const char *filename, int *width,
     int i, nlines = (*src->get_pixel_rows) (cinfo, src);
 
     for (i = 0; i < nlines; i++) {
-      unsigned char *dstptr;
+      JSAMPLE *dstptr;
       int row;
 
       row = cinfo->next_scanline + i;
@@ -2518,10 +2539,10 @@ DLLEXPORT unsigned char *tjLoadImage(const char *filename, int *width,
       else dstptr = &dstBuf[row * pitch];
 #ifndef JCS_EXTENSIONS
       if (dstBuf == rgbBuf)
-        memcpy(dstptr, src->buffer[i], (*width) * 3);
+        memcpy(dstptr, src->buffer[i], (*width) * 3 * sizeof(JSAMPLE));
       else
 #endif
-        memcpy(dstptr, src->buffer[i], (*width) * tjPixelSize[*pixelFormat]);
+        memcpy(dstptr, src->buffer[i], (*width) * tjPixelSize[*pixelFormat] * sizeof(JSAMPLE));
     }
     cinfo->next_scanline += nlines;
   }
@@ -2548,7 +2569,7 @@ bailout:
 
 
 /* TurboJPEG 2.0+ */
-DLLEXPORT int tjSaveImage(const char *filename, unsigned char *buffer,
+DLLEXPORT int tjSaveImage(const char *filename, JSAMPLE *buffer,
                           int width, int pitch, int height, int pixelFormat,
                           int flags)
 {
@@ -2561,7 +2582,7 @@ DLLEXPORT int tjSaveImage(const char *filename, unsigned char *buffer,
   char *ptr = NULL;
   boolean invert;
 #ifndef JCS_EXTENSIONS
-  unsigned char *rgbBuf = NULL;
+  JSAMPLE *rgbBuf = NULL;
 #endif
 
   if (!filename || !buffer || width < 1 || pitch < 0 || height < 1 ||
@@ -2594,7 +2615,7 @@ DLLEXPORT int tjSaveImage(const char *filename, unsigned char *buffer,
   if (pixelFormat != TJPF_GRAY &&
       (tjRedOffset[pixelFormat] != 0 || tjGreenOffset[pixelFormat] != 1 ||
        tjBlueOffset[pixelFormat] != 2 || tjPixelSize[pixelFormat] != 3)) {
-    rgbBuf = (unsigned char *)malloc(width * height * 3);
+    rgbBuf = (JSAMPLE *)malloc(width * height * 3 * sizeof(JSAMPLE));
     if (!rgbBuf) THROW("tjSaveImage(): Memory allocation failure");
     buffer = toRGB(buffer, width, pitch, height, pixelFormat, rgbBuf, 0, 1, 2,
                    3);
@@ -2610,6 +2631,7 @@ DLLEXPORT int tjSaveImage(const char *filename, unsigned char *buffer,
 
   ptr = strrchr(filename, '.');
   if (ptr && !strcasecmp(ptr, ".bmp")) {
+#if BITS_IN_JSAMPLE == 8
 #ifdef LIBJPEG_TURBO_VERSION
     if ((dst = jinit_write_bmp(dinfo, FALSE, FALSE)) == NULL)
       THROWG("tjSaveImage(): Could not initialize bitmap writer");
@@ -2618,6 +2640,9 @@ DLLEXPORT int tjSaveImage(const char *filename, unsigned char *buffer,
     if ((dst = jinit_write_bmp(dinfo, FALSE)) == NULL)
       THROWG("tjSaveImage(): Could not initialize bitmap writer");
     invert = (flags & TJFLAG_BOTTOMUP) != 0;
+#endif
+#else
+    THROWG("tjSaveImage(): BMP files require 8-bit data precision");
 #endif
   } else {
     if ((dst = jinit_write_ppm(dinfo)) == NULL)
@@ -2632,14 +2657,13 @@ DLLEXPORT int tjSaveImage(const char *filename, unsigned char *buffer,
   if (pitch == 0) pitch = width * tjPixelSize[pixelFormat];
 
   while (dinfo->output_scanline < dinfo->output_height) {
-    unsigned char *rowptr;
+    JSAMPLE *rowptr;
 
     if (invert)
       rowptr = &buffer[(height - dinfo->output_scanline - 1) * pitch];
     else
       rowptr = &buffer[dinfo->output_scanline * pitch];
-
-    memcpy(dst->buffer[0], rowptr, width * tjPixelSize[pixelFormat]);
+    memcpy(dst->buffer[0], rowptr, width * tjPixelSize[pixelFormat] * sizeof(JSAMPLE));
     (*dst->put_pixel_rows) (dinfo, dst, 1);
     dinfo->output_scanline++;
   }

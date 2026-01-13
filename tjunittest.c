@@ -58,9 +58,11 @@ static void usage(char *progName)
 {
   printf("\nUSAGE: %s [options]\n\n", progName);
   printf("Options:\n");
+#if BITS_IN_JSAMPLE == 8
   printf("-yuv = test YUV encoding/compression/decompression/decoding\n");
   printf("-noyuvpad = do not pad each row in each Y, U, and V plane to the nearest\n");
   printf("            multiple of 4 bytes\n");
+#endif
   printf("-alloc = test automatic JPEG buffer allocation\n");
   printf("-bmp = test packed-pixel image I/O\n");
   exit(1);
@@ -96,39 +98,45 @@ static const int _4byteFormats[] = {
   TJPF_RGBX, TJPF_BGRX, TJPF_XBGR, TJPF_XRGB, TJPF_CMYK
 };
 static const int _onlyGray[] = { TJPF_GRAY };
+#if BITS_IN_JSAMPLE == 8
 static const int _onlyRGB[] = { TJPF_RGB };
 
-static int doYUV = 0, alloc = 0, yuvAlign = 4;
+static int doYUV = 0, yuvAlign = 4;
+#endif
+static int alloc = 0;
 
 static int exitStatus = 0;
 #define BAILOUT() { exitStatus = -1;  goto bailout; }
 
 
-static void initBuf(unsigned char *buf, int w, int h, int pf, int flags)
+static void initBuf(JSAMPLE *buf, int w, int h, int pf, int flags)
 {
   int roffset = tjRedOffset[pf];
   int goffset = tjGreenOffset[pf];
   int boffset = tjBlueOffset[pf];
   int ps = tjPixelSize[pf];
   int index, row, col, halfway = 16;
+  int redToY = (19595U * MAXJSAMPLE) >> 16;
+  int yellowToY = (58065U * MAXJSAMPLE) >> 16;
 
   if (pf == TJPF_GRAY) {
-    memset(buf, 0, w * h * ps);
+    memset(buf, 0, w * h * ps * sizeof(JSAMPLE));
     for (row = 0; row < h; row++) {
       for (col = 0; col < w; col++) {
         if (flags & TJFLAG_BOTTOMUP) index = (h - row - 1) * w + col;
         else index = row * w + col;
         if (((row / 8) + (col / 8)) % 2 == 0)
-          buf[index] = (row < halfway) ? 255 : 0;
-        else buf[index] = (row < halfway) ? 76 : 226;
+          buf[index] = (row < halfway) ? MAXJSAMPLE : 0;
+        else buf[index] = (row < halfway) ? redToY : yellowToY;
       }
     }
   } else if (pf == TJPF_CMYK) {
-    memset(buf, 255, w * h * ps);
     for (row = 0; row < h; row++) {
       for (col = 0; col < w; col++) {
         if (flags & TJFLAG_BOTTOMUP) index = (h - row - 1) * w + col;
         else index = row * w + col;
+        buf[index * ps + 0] = buf[index * ps + 1] = buf[index * ps + 2] =
+          buf[index * ps + 3] = MAXJSAMPLE;
         if (((row / 8) + (col / 8)) % 2 == 0) {
           if (row >= halfway) buf[index * ps + 3] = 0;
         } else {
@@ -138,20 +146,20 @@ static void initBuf(unsigned char *buf, int w, int h, int pf, int flags)
       }
     }
   } else {
-    memset(buf, 0, w * h * ps);
+    memset(buf, 0, w * h * ps * sizeof(JSAMPLE));
     for (row = 0; row < h; row++) {
       for (col = 0; col < w; col++) {
         if (flags & TJFLAG_BOTTOMUP) index = (h - row - 1) * w + col;
         else index = row * w + col;
         if (((row / 8) + (col / 8)) % 2 == 0) {
           if (row < halfway) {
-            buf[index * ps + roffset] = 255;
-            buf[index * ps + goffset] = 255;
-            buf[index * ps + boffset] = 255;
+            buf[index * ps + roffset] = MAXJSAMPLE;
+            buf[index * ps + goffset] = MAXJSAMPLE;
+            buf[index * ps + boffset] = MAXJSAMPLE;
           }
         } else {
-          buf[index * ps + roffset] = 255;
-          if (row >= halfway) buf[index * ps + goffset] = 255;
+          buf[index * ps + roffset] = MAXJSAMPLE;
+          if (row >= halfway) buf[index * ps + goffset] = MAXJSAMPLE;
         }
       }
     }
@@ -160,7 +168,7 @@ static void initBuf(unsigned char *buf, int w, int h, int pf, int flags)
 
 
 #define CHECKVAL(v, cv) { \
-  if (v < cv - 1 || v > cv + 1) { \
+  if (v < cv - sizeof(JSAMPLE) || v > cv + sizeof(JSAMPLE)) { \
     printf("\nComp. %s at %d,%d should be %d, not %d\n", #v, row, col, cv, \
            v); \
     retval = 0;  exitStatus = -1;  goto bailout; \
@@ -168,21 +176,21 @@ static void initBuf(unsigned char *buf, int w, int h, int pf, int flags)
 }
 
 #define CHECKVAL0(v) { \
-  if (v > 1) { \
+  if (v > sizeof(JSAMPLE)) { \
     printf("\nComp. %s at %d,%d should be 0, not %d\n", #v, row, col, v); \
     retval = 0;  exitStatus = -1;  goto bailout; \
   } \
 }
 
 #define CHECKVAL255(v) { \
-  if (v < 254) { \
-    printf("\nComp. %s at %d,%d should be 255, not %d\n", #v, row, col, v); \
+  if (v < MAXJSAMPLE - sizeof(JSAMPLE)) { \
+    printf("\nComp. %s at %d,%d should be %d, not %d\n", #v, row, col, MAXJSAMPLE, v); \
     retval = 0;  exitStatus = -1;  goto bailout; \
   } \
 }
 
 
-static int checkBuf(unsigned char *buf, int w, int h, int pf, int subsamp,
+static int checkBuf(JSAMPLE *buf, int w, int h, int pf, int subsamp,
                     tjscalingfactor sf, int flags)
 {
   int roffset = tjRedOffset[pf];
@@ -193,13 +201,15 @@ static int checkBuf(unsigned char *buf, int w, int h, int pf, int subsamp,
   int index, row, col, retval = 1;
   int halfway = 16 * sf.num / sf.denom;
   int blocksize = 8 * sf.num / sf.denom;
+  int redToY = (19595U * MAXJSAMPLE) >> 16;
+  int yellowToY = (58065U * MAXJSAMPLE) >> 16;
 
   if (pf == TJPF_GRAY) roffset = goffset = boffset = 0;
 
   if (pf == TJPF_CMYK) {
     for (row = 0; row < h; row++) {
       for (col = 0; col < w; col++) {
-        unsigned char c, m, y, k;
+        JSAMPLE c, m, y, k;
 
         if (flags & TJFLAG_BOTTOMUP) index = (h - row - 1) * w + col;
         else index = row * w + col;
@@ -223,14 +233,14 @@ static int checkBuf(unsigned char *buf, int w, int h, int pf, int subsamp,
 
   for (row = 0; row < h; row++) {
     for (col = 0; col < w; col++) {
-      unsigned char r, g, b, a;
+      JSAMPLE r, g, b, a;
 
       if (flags & TJFLAG_BOTTOMUP) index = (h - row - 1) * w + col;
       else index = row * w + col;
       r = buf[index * ps + roffset];
       g = buf[index * ps + goffset];
       b = buf[index * ps + boffset];
-      a = aoffset >= 0 ? buf[index * ps + aoffset] : 0xFF;
+      a = aoffset >= 0 ? buf[index * ps + aoffset] : MAXJSAMPLE;
       if (((row / blocksize) + (col / blocksize)) % 2 == 0) {
         if (row < halfway) {
           CHECKVAL255(r);  CHECKVAL255(g);  CHECKVAL255(b);
@@ -240,9 +250,9 @@ static int checkBuf(unsigned char *buf, int w, int h, int pf, int subsamp,
       } else {
         if (subsamp == TJSAMP_GRAY) {
           if (row < halfway) {
-            CHECKVAL(r, 76);  CHECKVAL(g, 76);  CHECKVAL(b, 76);
+            CHECKVAL(r, redToY);  CHECKVAL(g, redToY);  CHECKVAL(b, redToY);
           } else {
-            CHECKVAL(r, 226);  CHECKVAL(g, 226);  CHECKVAL(b, 226);
+            CHECKVAL(r, yellowToY);  CHECKVAL(g, yellowToY);  CHECKVAL(b, yellowToY);
           }
         } else {
           if (row < halfway) {
@@ -277,6 +287,8 @@ bailout:
 
 
 #define PAD(v, p)  ((v + (p) - 1) & (~((p) - 1)))
+
+#if BITS_IN_JSAMPLE == 8
 
 static int checkBufYUV(unsigned char *buf, int w, int h, int subsamp,
                        tjscalingfactor sf)
@@ -349,6 +361,8 @@ bailout:
   return retval;
 }
 
+#endif
+
 
 static void writeJPEG(unsigned char *jpegBuf, unsigned long jpegSize,
                       char *filename)
@@ -370,19 +384,23 @@ static void compTest(tjhandle handle, unsigned char **dstBuf,
                      char *basename, int subsamp, int jpegQual, int flags)
 {
   char tempStr[1024];
-  unsigned char *srcBuf = NULL, *yuvBuf = NULL;
+  JSAMPLE *srcBuf = NULL;
+#if BITS_IN_JSAMPLE == 8
+  unsigned char *yuvBuf = NULL;
+#endif
   const char *pfStr = pixFormatStr[pf];
   const char *buStrLong =
     (flags & TJFLAG_BOTTOMUP) ? "Bottom-Up" : "Top-Down ";
   const char *buStr = (flags & TJFLAG_BOTTOMUP) ? "BU" : "TD";
 
-  if ((srcBuf = (unsigned char *)malloc(w * h * tjPixelSize[pf])) == NULL)
+  if ((srcBuf = (JSAMPLE *)malloc(w * h * tjPixelSize[pf] * sizeof(JSAMPLE))) == NULL)
     THROW("Memory allocation failure");
   initBuf(srcBuf, w, h, pf, flags);
 
   if (*dstBuf && *dstSize > 0) memset(*dstBuf, 0, *dstSize);
 
   if (!alloc) flags |= TJFLAG_NOREALLOC;
+#if BITS_IN_JSAMPLE == 8
   if (doYUV) {
     unsigned long yuvSize = tjBufSizeYUV2(w, yuvAlign, h, subsamp);
     tjscalingfactor sf = { 1, 1 };
@@ -405,7 +423,9 @@ static void compTest(tjhandle handle, unsigned char **dstBuf,
            jpegQual);
     TRY_TJ(tjCompressFromYUV(handle, yuvBuf, w, yuvAlign, h, subsamp, dstBuf,
                              dstSize, jpegQual, flags));
-  } else {
+  } else
+#endif
+  {
     printf("%s %s -> %s Q%d ... ", pfStr, buStrLong, subNameLong[subsamp],
            jpegQual);
     TRY_TJ(tjCompress2(handle, srcBuf, w, 0, h, pf, dstBuf, dstSize, subsamp,
@@ -418,7 +438,9 @@ static void compTest(tjhandle handle, unsigned char **dstBuf,
   printf("Done.\n  Result in %s\n", tempStr);
 
 bailout:
+#if BITS_IN_JSAMPLE == 8
   free(yuvBuf);
+#endif
   free(srcBuf);
 }
 
@@ -428,7 +450,10 @@ static void _decompTest(tjhandle handle, unsigned char *jpegBuf,
                         char *basename, int subsamp, int flags,
                         tjscalingfactor sf)
 {
-  unsigned char *dstBuf = NULL, *yuvBuf = NULL;
+  JSAMPLE *dstBuf = NULL;
+#if BITS_IN_JSAMPLE == 8
+  unsigned char *yuvBuf = NULL;
+#endif
   int _hdrw = 0, _hdrh = 0, _hdrsubsamp = -1;
   int scaledWidth = TJSCALED(w, sf);
   int scaledHeight = TJSCALED(h, sf);
@@ -439,11 +464,12 @@ static void _decompTest(tjhandle handle, unsigned char *jpegBuf,
   if (_hdrw != w || _hdrh != h || _hdrsubsamp != subsamp)
     THROW("Incorrect JPEG header");
 
-  dstSize = scaledWidth * scaledHeight * tjPixelSize[pf];
-  if ((dstBuf = (unsigned char *)malloc(dstSize)) == NULL)
+  dstSize = scaledWidth * scaledHeight * tjPixelSize[pf] * sizeof(JSAMPLE);
+  if ((dstBuf = (JSAMPLE *)malloc(dstSize)) == NULL)
     THROW("Memory allocation failure");
   memset(dstBuf, 0, dstSize);
 
+#if BITS_IN_JSAMPLE == 8
   if (doYUV) {
     unsigned long yuvSize = tjBufSizeYUV2(scaledWidth, yuvAlign, scaledHeight,
                                           subsamp);
@@ -474,7 +500,9 @@ static void _decompTest(tjhandle handle, unsigned char *jpegBuf,
     TRY_TJ(tjDecodeYUV(handle2, yuvBuf, yuvAlign, subsamp, dstBuf, scaledWidth,
                        0, scaledHeight, pf, flags));
     tjDestroy(handle2);
-  } else {
+  } else
+#endif
+  {
     printf("JPEG -> %s %s ", pixFormatStr[pf],
            (flags & TJFLAG_BOTTOMUP) ? "Bottom-Up" : "Top-Down ");
     if (sf.num != 1 || sf.denom != 1)
@@ -493,7 +521,9 @@ static void _decompTest(tjhandle handle, unsigned char *jpegBuf,
   printf("\n");
 
 bailout:
+#if BITS_IN_JSAMPLE == 8
   free(yuvBuf);
+#endif
   free(dstBuf);
 }
 
@@ -581,21 +611,26 @@ bailout:
     THROW(#function " overflow"); \
 }
 #endif
+#if BITS_IN_JSAMPLE == 8
 #define CHECKSIZEINT(function) { \
   if (intsize != -1 || !strcmp(tjGetErrorStr2(NULL), "No error")) \
     THROW(#function " overflow"); \
 }
+#endif
 
 static void overflowTest(void)
 {
   /* Ensure that the various buffer size functions don't overflow */
   unsigned long size;
+#if BITS_IN_JSAMPLE == 8
   int intsize;
+#endif
 
   size = tjBufSize(26755, 26755, TJSAMP_444);
   CHECKSIZE(tjBufSize());
   size = TJBUFSIZE(26755, 26755);
   CHECKSIZE(TJBUFSIZE());
+#if BITS_IN_JSAMPLE == 8
   size = tjBufSizeYUV2(37838, 1, 37838, TJSAMP_444);
   CHECKSIZE(tjBufSizeYUV2());
   size = tjBufSizeYUV2(37837, 3, 37837, TJSAMP_444);
@@ -612,6 +647,7 @@ static void overflowTest(void)
   CHECKSIZEINT(tjPlaneWidth());
   intsize = tjPlaneHeight(0, INT_MAX, TJSAMP_420);
   CHECKSIZEINT(tjPlaneHeight());
+#endif
 
 bailout:
   return;
@@ -621,7 +657,8 @@ bailout:
 static void bufSizeTest(void)
 {
   int w, h, i, subsamp;
-  unsigned char *srcBuf = NULL, *dstBuf = NULL;
+  JSAMPLE *srcBuf = NULL;
+  unsigned char *dstBuf = NULL;
   tjhandle handle = NULL;
   unsigned long dstSize = 0;
 
@@ -634,24 +671,34 @@ static void bufSizeTest(void)
 
       for (h = 1; h < maxh; h++) {
         if (h % 100 == 0) printf("%.4d x %.4d\b\b\b\b\b\b\b\b\b\b\b", w, h);
-        if ((srcBuf = (unsigned char *)malloc(w * h * 4)) == NULL)
+        if ((srcBuf = (JSAMPLE *)malloc(w * h * 4 * sizeof(JSAMPLE))) == NULL)
           THROW("Memory allocation failure");
-        if (!alloc || doYUV) {
+        if (!alloc
+#if BITS_IN_JSAMPLE == 8
+            || doYUV
+#endif
+           ) {
+#if BITS_IN_JSAMPLE == 8
           if (doYUV) dstSize = tjBufSizeYUV2(w, yuvAlign, h, subsamp);
-          else dstSize = tjBufSize(w, h, subsamp);
+          else
+#endif
+          dstSize = tjBufSize(w, h, subsamp);
           if ((dstBuf = (unsigned char *)tjAlloc(dstSize)) == NULL)
             THROW("Memory allocation failure");
         }
 
         for (i = 0; i < w * h * 4; i++) {
           if (random() < RAND_MAX / 2) srcBuf[i] = 0;
-          else srcBuf[i] = 255;
+          else srcBuf[i] = MAXJSAMPLE;
         }
 
+#if BITS_IN_JSAMPLE == 8
         if (doYUV) {
           TRY_TJ(tjEncodeYUV3(handle, srcBuf, w, 0, h, TJPF_BGRX, dstBuf,
                               yuvAlign, subsamp, 0));
-        } else {
+        } else
+#endif
+        {
           /* Verify that the API is hardened against hypothetical applications
              that may erroneously set the JPEG destination buffer size to 0
              while reusing the destination buffer pointer. */
@@ -661,35 +708,53 @@ static void bufSizeTest(void)
                              alloc ? 0 : TJFLAG_NOREALLOC));
         }
         free(srcBuf);  srcBuf = NULL;
-        if (!alloc || doYUV) {
+        if (!alloc
+#if BITS_IN_JSAMPLE == 8
+            || doYUV
+#endif
+           ) {
           tjFree(dstBuf);  dstBuf = NULL;
         }
 
-        if ((srcBuf = (unsigned char *)malloc(h * w * 4)) == NULL)
+        if ((srcBuf = (JSAMPLE *)malloc(h * w * 4 * sizeof(JSAMPLE))) == NULL)
           THROW("Memory allocation failure");
-        if (!alloc || doYUV) {
+        if (!alloc
+#if BITS_IN_JSAMPLE == 8
+            || doYUV
+#endif
+           ) {
+#if BITS_IN_JSAMPLE == 8
           if (doYUV) dstSize = tjBufSizeYUV2(h, yuvAlign, w, subsamp);
-          else dstSize = tjBufSize(h, w, subsamp);
+          else
+#endif
+          dstSize = tjBufSize(h, w, subsamp);
           if ((dstBuf = (unsigned char *)tjAlloc(dstSize)) == NULL)
             THROW("Memory allocation failure");
         }
 
         for (i = 0; i < h * w * 4; i++) {
           if (random() < RAND_MAX / 2) srcBuf[i] = 0;
-          else srcBuf[i] = 255;
+          else srcBuf[i] = MAXJSAMPLE;
         }
 
+#if BITS_IN_JSAMPLE == 8
         if (doYUV) {
           TRY_TJ(tjEncodeYUV3(handle, srcBuf, h, 0, w, TJPF_BGRX, dstBuf,
                               yuvAlign, subsamp, 0));
-        } else {
+        } else
+#endif
+        {
           if (alloc && (w > 1 || h > 1)) dstSize = 0;
           TRY_TJ(tjCompress2(handle, srcBuf, h, 0, w, TJPF_BGRX, &dstBuf,
                              &dstSize, subsamp, 100,
                              alloc ? 0 : TJFLAG_NOREALLOC));
         }
         free(srcBuf);  srcBuf = NULL;
-        if (!alloc || doYUV) {
+        if (!alloc
+#if BITS_IN_JSAMPLE == 8
+            || doYUV
+#endif
+           ) {
           tjFree(dstBuf);  dstBuf = NULL;
         }
       }
@@ -704,7 +769,7 @@ bailout:
 }
 
 
-static void initBitmap(unsigned char *buf, int width, int pitch, int height,
+static void initBitmap(JSAMPLE *buf, int width, int pitch, int height,
                        int pf, int flags)
 {
   int roffset = tjRedOffset[pf];
@@ -717,11 +782,11 @@ static void initBitmap(unsigned char *buf, int width, int pitch, int height,
     int row = (flags & TJFLAG_BOTTOMUP) ? height - j - 1 : j;
 
     for (i = 0; i < width; i++) {
-      unsigned char r = (i * 256 / width) % 256;
-      unsigned char g = (j * 256 / height) % 256;
-      unsigned char b = (j * 256 / height + i * 256 / width) % 256;
+      JSAMPLE r = (i * (MAXJSAMPLE + 1) / width) % (MAXJSAMPLE + 1);
+      JSAMPLE g = (j * (MAXJSAMPLE + 1) / height) % (MAXJSAMPLE + 1);
+      JSAMPLE b = (j * (MAXJSAMPLE + 1) / height + i * (MAXJSAMPLE + 1) / width) % (MAXJSAMPLE + 1);
 
-      memset(&buf[row * pitch + i * ps], 0, ps);
+      memset(&buf[row * pitch + i * ps], 0, ps * sizeof(JSAMPLE));
       if (pf == TJPF_GRAY) buf[row * pitch + i * ps] = b;
 #ifdef LIBJPEG_TURBO_VERSION
       else if (pf == TJPF_CMYK)
@@ -740,7 +805,7 @@ static void initBitmap(unsigned char *buf, int width, int pitch, int height,
 }
 
 
-static int cmpBitmap(unsigned char *buf, int width, int pitch, int height,
+static int cmpBitmap(JSAMPLE *buf, int width, int pitch, int height,
                      int pf, int flags, int gray2rgb)
 {
   int roffset = tjRedOffset[pf];
@@ -754,9 +819,9 @@ static int cmpBitmap(unsigned char *buf, int width, int pitch, int height,
     int row = (flags & TJFLAG_BOTTOMUP) ? height - j - 1 : j;
 
     for (i = 0; i < width; i++) {
-      unsigned char r = (i * 256 / width) % 256;
-      unsigned char g = (j * 256 / height) % 256;
-      unsigned char b = (j * 256 / height + i * 256 / width) % 256;
+      JSAMPLE r = (i * (MAXJSAMPLE + 1) / width) % (MAXJSAMPLE + 1);
+      JSAMPLE g = (j * (MAXJSAMPLE + 1) / height) % (MAXJSAMPLE + 1);
+      JSAMPLE b = (j * (MAXJSAMPLE + 1) / height + i * (MAXJSAMPLE + 1) / width) % (MAXJSAMPLE + 1);
 
       if (pf == TJPF_GRAY) {
         if (buf[row * pitch + i * ps] != b)
@@ -784,7 +849,7 @@ static int cmpBitmap(unsigned char *buf, int width, int pitch, int height,
                    buf[row * pitch + i * ps + goffset] != g ||
                    buf[row * pitch + i * ps + boffset] != b)
           return 0;
-        if (aoffset >= 0 && buf[row * pitch + i * ps + aoffset] != 0xFF)
+        if (aoffset >= 0 && buf[row * pitch + i * ps + aoffset] != MAXJSAMPLE)
           return 0;
       }
     }
@@ -799,18 +864,26 @@ static int doBmpTest(const char *ext, int width, int align, int height, int pf,
   char filename[80], *md5sum, md5buf[65];
   int ps = tjPixelSize[pf], pitch = PAD(width * ps, align), loadWidth = 0,
     loadHeight = 0, retval = 0, pixelFormat = pf;
-  unsigned char *buf = NULL;
+  JSAMPLE *buf = NULL;
   char *md5ref;
 
   if (pf == TJPF_GRAY) {
+#if BITS_IN_JSAMPLE == 8
     md5ref = !strcasecmp(ext, "ppm") ? "112c682e82ce5de1cca089e20d60000b" :
                                        "51976530acf75f02beddf5d21149101d";
+#else
+    md5ref = "0d1895c7e6f2b2c9af6e821a655c239c";
+#endif
   } else {
+#if BITS_IN_JSAMPLE == 8
     md5ref = !strcasecmp(ext, "ppm") ? "c0c9f772b464d1896326883a5c79c545" :
                                        "6d659071b9bfcdee2def22cb58ddadca";
+#else
+    md5ref = "2ff5299287017502832c99718450c90a";
+#endif
   }
 
-  if ((buf = (unsigned char *)tjAlloc(pitch * height)) == NULL)
+  if ((buf = (JSAMPLE *)tjAlloc(pitch * height * sizeof(JSAMPLE))) == NULL)
     THROW("Could not allocate memory");
   initBitmap(buf, width, pitch, height, pf, flags);
 
@@ -821,7 +894,7 @@ static int doBmpTest(const char *ext, int width, int align, int height, int pf,
   if (strcasecmp(md5sum, md5ref))
     THROW_MD5(filename, md5sum, md5ref);
 
-  tjFree(buf);  buf = NULL;
+  tjFree((unsigned char *)buf);  buf = NULL;
   if ((buf = tjLoadImage(filename, &loadWidth, align, &loadHeight, &pf,
                          flags)) == NULL)
     THROW_TJ();
@@ -860,7 +933,7 @@ static int doBmpTest(const char *ext, int width, int align, int height, int pf,
 #endif
   /* Verify that tjLoadImage() returns the proper "preferred" pixel format for
      the file type. */
-  tjFree(buf);  buf = NULL;
+  tjFree((unsigned char *)buf);  buf = NULL;
   pf = pixelFormat;
   pixelFormat = TJPF_UNKNOWN;
   if ((buf = tjLoadImage(filename, &loadWidth, align, &loadHeight,
@@ -878,7 +951,7 @@ static int doBmpTest(const char *ext, int width, int align, int height, int pf,
   unlink(filename);
 
 bailout:
-  tjFree(buf);
+  tjFree((unsigned char *)buf);
   if (exitStatus < 0) return exitStatus;
   return retval;
 }
@@ -895,6 +968,7 @@ static int bmpTest(void)
 
   for (align = 1; align <= 8; align *= 2) {
     for (format = 0; format < maxPixelFormat; format++) {
+#if BITS_IN_JSAMPLE == 8
 #ifndef LIBJPEG_TURBO_VERSION
       if (format != TJPF_GRAY) {
 #endif
@@ -906,6 +980,7 @@ static int bmpTest(void)
 #ifndef LIBJPEG_TURBO_VERSION
       }
 #endif
+#endif
 
       printf("%s Top-Down PPM (row alignment = %d bytes)  ...  ",
              pixFormatStr[format], align);
@@ -913,6 +988,7 @@ static int bmpTest(void)
         return -1;
       printf("OK.\n");
 
+#if BITS_IN_JSAMPLE == 8
 #ifndef LIBJPEG_TURBO_VERSION
       if (format != TJPF_GRAY) {
 #endif
@@ -924,6 +1000,7 @@ static int bmpTest(void)
         printf("OK.\n");
 #ifndef LIBJPEG_TURBO_VERSION
       }
+#endif
 #endif
 
       printf("%s Bottom-Up PPM (row alignment = %d bytes)  ...  ",
@@ -948,15 +1025,20 @@ int main(int argc, char *argv[])
 #endif
   if (argc > 1) {
     for (i = 1; i < argc; i++) {
+#if BITS_IN_JSAMPLE == 8
       if (!strcasecmp(argv[i], "-yuv")) doYUV = 1;
       else if (!strcasecmp(argv[i], "-noyuvpad")) yuvAlign = 1;
-      else if (!strcasecmp(argv[i], "-alloc")) alloc = 1;
+      else
+#endif
+      if (!strcasecmp(argv[i], "-alloc")) alloc = 1;
       else if (!strcasecmp(argv[i], "-bmp")) return bmpTest();
       else usage(argv[0]);
     }
   }
   if (alloc) printf("Testing automatic buffer allocation\n");
+#if BITS_IN_JSAMPLE == 8
   if (doYUV) num4bf = 4;
+#endif
   overflowTest();
   doTest(35, 39, _3byteFormats, 2, TJSAMP_444, "test");
   doTest(39, 41, _4byteFormats, num4bf, TJSAMP_444, "test");
@@ -972,6 +1054,7 @@ int main(int argc, char *argv[])
   doTest(41, 35, _3byteFormats, 2, TJSAMP_GRAY, "test");
   doTest(35, 39, _4byteFormats, 4, TJSAMP_GRAY, "test");
   bufSizeTest();
+#if BITS_IN_JSAMPLE == 8
   if (doYUV) {
     printf("\n--------------------\n\n");
     doTest(48, 48, _onlyRGB, 1, TJSAMP_444, "test_yuv0");
@@ -982,6 +1065,7 @@ int main(int argc, char *argv[])
     doTest(48, 48, _onlyRGB, 1, TJSAMP_GRAY, "test_yuv0");
     doTest(48, 48, _onlyGray, 1, TJSAMP_GRAY, "test_yuv0");
   }
+#endif
 
   return exitStatus;
 }

@@ -1,6 +1,6 @@
 /*
- * Copyright (C)2009-2015, 2017, 2020-2021, 2023-2024 D. R. Commander.
- *                                                    All Rights Reserved.
+ * Copyright (C)2009-2015, 2017, 2020-2021, 2023-2024, 2026 D. R. Commander.
+ *           All Rights Reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -29,6 +29,8 @@
 
 #ifndef __TURBOJPEG_H__
 #define __TURBOJPEG_H__
+
+#include <jpeglib.h>
 
 #if defined(_WIN32) && defined(DLLDEFINE)
 #define DLLEXPORT  __declspec(dllexport)
@@ -834,11 +836,13 @@ DLLEXPORT tjhandle tjInitCompress(void);
  * @return 0 if successful, or -1 if an error occurred (see #tjGetErrorStr2()
  * and #tjGetErrorCode().)
  */
-DLLEXPORT int tjCompress2(tjhandle handle, const unsigned char *srcBuf,
+DLLEXPORT int tjCompress2(tjhandle handle, const JSAMPLE *srcBuf,
                           int width, int pitch, int height, int pixelFormat,
                           unsigned char **jpegBuf, unsigned long *jpegSize,
                           int jpegSubsamp, int jpegQual, int flags);
 
+
+#if BITS_IN_JSAMPLE == 8
 
 /**
  * Compress a unified planar YUV image into a JPEG image.
@@ -978,6 +982,8 @@ DLLEXPORT int tjCompressFromYUVPlanes(tjhandle handle,
                                       unsigned long *jpegSize, int jpegQual,
                                       int flags);
 
+#endif
+
 
 /**
  * The maximum size of the buffer (in bytes) required to hold a JPEG image with
@@ -1003,6 +1009,8 @@ DLLEXPORT int tjCompressFromYUVPlanes(tjhandle handle,
  */
 DLLEXPORT unsigned long tjBufSize(int width, int height, int jpegSubsamp);
 
+
+#if BITS_IN_JSAMPLE == 8
 
 /**
  * The size of the buffer (in bytes) required to hold a unified planar YUV
@@ -1200,6 +1208,8 @@ DLLEXPORT int tjEncodeYUVPlanes(tjhandle handle, const unsigned char *srcBuf,
                                 int pixelFormat, unsigned char **dstPlanes,
                                 int *strides, int subsamp, int flags);
 
+#endif
+
 
 /**
  * Create a TurboJPEG decompressor instance.
@@ -1320,10 +1330,12 @@ DLLEXPORT tjscalingfactor *tjGetScalingFactors(int *numScalingFactors);
  * and #tjGetErrorCode().)
  */
 DLLEXPORT int tjDecompress2(tjhandle handle, const unsigned char *jpegBuf,
-                            unsigned long jpegSize, unsigned char *dstBuf,
+                            unsigned long jpegSize, JSAMPLE *dstBuf,
                             int width, int pitch, int height, int pixelFormat,
                             int flags);
 
+
+#if BITS_IN_JSAMPLE == 8
 
 /**
  * Decompress a JPEG image into a unified planar YUV image.  This function
@@ -1553,6 +1565,8 @@ DLLEXPORT int tjDecodeYUVPlanes(tjhandle handle,
                                 unsigned char *dstBuf, int width, int pitch,
                                 int height, int pixelFormat, int flags);
 
+#endif
+
 
 /**
  * Create a new TurboJPEG transformer instance.
@@ -1700,9 +1714,9 @@ DLLEXPORT unsigned char *tjAlloc(int bytes);
  * alignment, or NULL if an error occurred (see #tjGetErrorStr2().)  This
  * buffer should be freed using #tjFree().
  */
-DLLEXPORT unsigned char *tjLoadImage(const char *filename, int *width,
-                                     int align, int *height, int *pixelFormat,
-                                     int flags);
+DLLEXPORT JSAMPLE *tjLoadImage(const char *filename, int *width,
+                               int align, int *height, int *pixelFormat,
+                               int flags);
 
 
 /**
@@ -1737,7 +1751,7 @@ DLLEXPORT unsigned char *tjLoadImage(const char *filename, int *width,
  *
  * @return 0 if successful, or -1 if an error occurred (see #tjGetErrorStr2().)
  */
-DLLEXPORT int tjSaveImage(const char *filename, unsigned char *buffer,
+DLLEXPORT int tjSaveImage(const char *filename, JSAMPLE *buffer,
                           int width, int pitch, int height, int pixelFormat,
                           int flags);
 
@@ -1804,13 +1818,13 @@ DLLEXPORT int tjGetErrorCode(tjhandle handle);
 
 DLLEXPORT unsigned long TJBUFSIZE(int width, int height);
 
-DLLEXPORT int tjCompress(tjhandle handle, unsigned char *srcBuf, int width,
+DLLEXPORT int tjCompress(tjhandle handle, JSAMPLE *srcBuf, int width,
                          int pitch, int height, int pixelSize,
                          unsigned char *dstBuf, unsigned long *compressedSize,
                          int jpegSubsamp, int jpegQual, int flags);
 
 DLLEXPORT int tjDecompress(tjhandle handle, unsigned char *jpegBuf,
-                           unsigned long jpegSize, unsigned char *dstBuf,
+                           unsigned long jpegSize, JSAMPLE *dstBuf,
                            int width, int pitch, int height, int pixelSize,
                            int flags);
 
@@ -1822,13 +1836,19 @@ DLLEXPORT char *tjGetErrorStr(void);
 
 /* TurboJPEG 1.1+ */
 
+#if BITS_IN_JSAMPLE == 8
+
 #define TJ_YUV  512
 
 DLLEXPORT unsigned long TJBUFSIZEYUV(int width, int height, int jpegSubsamp);
 
+#endif
+
 DLLEXPORT int tjDecompressHeader2(tjhandle handle, unsigned char *jpegBuf,
                                   unsigned long jpegSize, int *width,
                                   int *height, int *jpegSubsamp);
+
+#if BITS_IN_JSAMPLE == 8
 
 DLLEXPORT int tjDecompressToYUV(tjhandle handle, unsigned char *jpegBuf,
                                 unsigned long jpegSize, unsigned char *dstBuf,
@@ -1838,6 +1858,8 @@ DLLEXPORT int tjEncodeYUV(tjhandle handle, unsigned char *srcBuf, int width,
                           int pitch, int height, int pixelSize,
                           unsigned char *dstBuf, int subsamp, int flags);
 
+#endif
+
 /* TurboJPEG 1.2+ */
 
 #define TJFLAG_FORCEMMX  8
@@ -1845,11 +1867,15 @@ DLLEXPORT int tjEncodeYUV(tjhandle handle, unsigned char *srcBuf, int width,
 #define TJFLAG_FORCESSE2  32
 #define TJFLAG_FORCESSE3  128
 
+#if BITS_IN_JSAMPLE == 8
+
 DLLEXPORT unsigned long tjBufSizeYUV(int width, int height, int subsamp);
 
 DLLEXPORT int tjEncodeYUV2(tjhandle handle, unsigned char *srcBuf, int width,
                            int pitch, int height, int pixelFormat,
                            unsigned char *dstBuf, int subsamp, int flags);
+
+#endif
 
 /**
  * @}
