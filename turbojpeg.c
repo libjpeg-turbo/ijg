@@ -1,5 +1,6 @@
 /*
- * Copyright (C)2009-2012, 2014, 2017 D. R. Commander.  All Rights Reserved.
+ * Copyright (C)2009-2024, 2026 D. R. Commander.  All Rights Reserved.
+ * Copyright (C)2021 Alex Richardson.  All Rights Reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -29,427 +30,559 @@
 /* TurboJPEG/LJT:  this implements the TurboJPEG API using libjpeg or
    libjpeg-turbo */
 
-#include <stdio.h>
-#include <stdlib.h>
+#include <ctype.h>
+#include <limits.h>
+#if !defined(_MSC_VER) || _MSC_VER > 1600
+#include <stdint.h>
+#endif
 #include <jinclude.h>
 #define JPEG_INTERNALS
 #include <jpeglib.h>
 #include <jerror.h>
 #include <setjmp.h>
+#include <errno.h>
 #include "./turbojpeg.h"
 #include "./tjutil.h"
+#ifdef LIBJPEG_TURBO_VERSION
+#include "transupp.h"
+#else
 #include "transupp-tj.h"
+#endif
+#include "./jpegcomp.h"
+#include "./cdjpeg.h"
 
-extern void jpeg_mem_dest_tj(j_compress_ptr, unsigned char **,
-	unsigned long *, boolean);
-extern void jpeg_mem_src_tj(j_decompress_ptr, unsigned char *, unsigned long);
+#ifndef LIBJPEG_TURBO_VERSION
+#define MALLOC  malloc
+#define THREAD_LOCAL
+#endif
 
-#define PAD(v, p) ((v+(p)-1)&(~((p)-1)))
+extern void jpeg_mem_dest_tj(j_compress_ptr, unsigned char **, unsigned long *,
+                             boolean);
+extern void jpeg_mem_src_tj(j_decompress_ptr, const unsigned char *,
+                            unsigned long);
+
+#define PAD(v, p)  ((v + (p) - 1) & (~((p) - 1)))
+#define IS_POW2(x)  (((x) & (x - 1)) == 0)
 
 
-/* Error handling (based on example in example.c) */
+/* Error handling (based on example in example.txt) */
 
-static char errStr[JMSG_LENGTH_MAX]="No error";
+static THREAD_LOCAL char errStr[JMSG_LENGTH_MAX] = "No error";
 
-struct my_error_mgr
-{
-	struct jpeg_error_mgr pub;
-	jmp_buf setjmp_buffer;
+struct my_error_mgr {
+  struct jpeg_error_mgr pub;
+  jmp_buf setjmp_buffer;
+  void (*emit_message) (j_common_ptr, int);
+  boolean warning, stopOnWarning;
 };
 typedef struct my_error_mgr *my_error_ptr;
 
+#define JMESSAGE(code, string)  string,
+static const char *turbojpeg_message_table[] = {
+#include "cderror.h"
+  NULL
+};
+
 static void my_error_exit(j_common_ptr cinfo)
 {
-	my_error_ptr myerr=(my_error_ptr)cinfo->err;
-	(*cinfo->err->output_message)(cinfo);
-	longjmp(myerr->setjmp_buffer, 1);
+  my_error_ptr myerr = (my_error_ptr)cinfo->err;
+
+  (*cinfo->err->output_message) (cinfo);
+  longjmp(myerr->setjmp_buffer, 1);
 }
 
 /* Based on output_message() in jerror.c */
 
 static void my_output_message(j_common_ptr cinfo)
 {
-	(*cinfo->err->format_message)(cinfo, errStr);
+  (*cinfo->err->format_message) (cinfo, errStr);
+}
+
+static void my_emit_message(j_common_ptr cinfo, int msg_level)
+{
+  my_error_ptr myerr = (my_error_ptr)cinfo->err;
+
+  myerr->emit_message(cinfo, msg_level);
+  if (msg_level < 0) {
+    myerr->warning = TRUE;
+    if (myerr->stopOnWarning) longjmp(myerr->setjmp_buffer, 1);
+  }
 }
 
 
-/* Global structures, macros, etc. */
+/********************** Global structures, macros, etc. **********************/
 
-enum {COMPRESS=1, DECOMPRESS=2};
+enum { COMPRESS = 1, DECOMPRESS = 2 };
 
-typedef struct _tjinstance
-{
-	struct jpeg_compress_struct cinfo;
-	struct jpeg_decompress_struct dinfo;
-	struct my_error_mgr jerr;
-	int init;
+typedef struct _tjinstance {
+  struct jpeg_compress_struct cinfo;
+  struct jpeg_decompress_struct dinfo;
+  struct my_error_mgr jerr;
+  int init, headerRead;
+  char errStr[JMSG_LENGTH_MAX];
+  boolean isInstanceError;
 } tjinstance;
 
-static const int pixelsize[TJ_NUMSAMP]={3, 3, 3, 1, 3};
+struct my_progress_mgr {
+  struct jpeg_progress_mgr pub;
+  tjinstance *this;
+};
+typedef struct my_progress_mgr *my_progress_ptr;
 
-static const JXFORM_CODE xformtypes[TJ_NUMXOP]=
+static void my_progress_monitor(j_common_ptr dinfo)
 {
-	JXFORM_NONE, JXFORM_FLIP_H, JXFORM_FLIP_V, JXFORM_TRANSPOSE,
-	JXFORM_TRANSVERSE, JXFORM_ROT_90, JXFORM_ROT_180, JXFORM_ROT_270
+  my_error_ptr myerr = (my_error_ptr)dinfo->err;
+  my_progress_ptr myprog = (my_progress_ptr)dinfo->progress;
+
+  if (dinfo->is_decompressor) {
+    int scan_no = ((j_decompress_ptr)dinfo)->input_scan_number;
+
+    if (scan_no > 500) {
+      SNPRINTF(myprog->this->errStr, JMSG_LENGTH_MAX,
+               "Progressive JPEG image has more than 500 scans");
+      SNPRINTF(errStr, JMSG_LENGTH_MAX,
+               "Progressive JPEG image has more than 500 scans");
+      myprog->this->isInstanceError = TRUE;
+      myerr->warning = FALSE;
+      longjmp(myerr->setjmp_buffer, 1);
+    }
+  }
+}
+
+static const int pixelsize[TJ_NUMSAMP] = { 3, 3, 3, 1, 3, 3 };
+
+static const JXFORM_CODE xformtypes[TJ_NUMXOP] = {
+  JXFORM_NONE, JXFORM_FLIP_H, JXFORM_FLIP_V, JXFORM_TRANSPOSE,
+  JXFORM_TRANSVERSE, JXFORM_ROT_90, JXFORM_ROT_180, JXFORM_ROT_270
 };
 
-#define NUMSF 4
-static const tjscalingfactor sf[NUMSF]={
-	{1, 1},
-	{1, 2},
-	{1, 4},
-	{1, 8}
+#if defined(LIBJPEG_TURBO_VERSION) || JPEG_LIB_VERSION >= 70
+
+#define NUMSF  16
+static const tjscalingfactor sf[NUMSF] = {
+  { 2, 1 },
+  { 15, 8 },
+  { 7, 4 },
+  { 13, 8 },
+  { 3, 2 },
+  { 11, 8 },
+  { 5, 4 },
+  { 9, 8 },
+  { 1, 1 },
+  { 7, 8 },
+  { 3, 4 },
+  { 5, 8 },
+  { 1, 2 },
+  { 3, 8 },
+  { 1, 4 },
+  { 1, 8 }
 };
 
-#define _throw(m) {snprintf(errStr, JMSG_LENGTH_MAX, "%s", m);  \
-	retval=-1;  goto bailout;}
-#define getinstance(handle) tjinstance *this=(tjinstance *)handle;  \
-	j_compress_ptr cinfo=NULL;  j_decompress_ptr dinfo=NULL;  \
-	if(!this) {snprintf(errStr, JMSG_LENGTH_MAX, "Invalid handle");  \
-		return -1;}  \
-	cinfo=&this->cinfo;  dinfo=&this->dinfo;
+#else
+
+#define NUMSF  4
+static const tjscalingfactor sf[NUMSF] = {
+  { 1, 1 },
+  { 1, 2 },
+  { 1, 4 },
+  { 1, 8 }
+};
+
+#endif
+
+#ifdef JCS_EXTENSIONS
+
+static J_COLOR_SPACE pf2cs[TJ_NUMPF] = {
+  JCS_EXT_RGB, JCS_EXT_BGR, JCS_EXT_RGBX, JCS_EXT_BGRX, JCS_EXT_XBGR,
+  JCS_EXT_XRGB, JCS_GRAYSCALE, JCS_EXT_RGBA, JCS_EXT_BGRA, JCS_EXT_ABGR,
+  JCS_EXT_ARGB, JCS_CMYK
+};
+
+static int cs2pf[JPEG_NUMCS] = {
+  TJPF_UNKNOWN, TJPF_GRAY,
+#if RGB_RED == 0 && RGB_GREEN == 1 && RGB_BLUE == 2 && RGB_PIXELSIZE == 3
+  TJPF_RGB,
+#elif RGB_RED == 2 && RGB_GREEN == 1 && RGB_BLUE == 0 && RGB_PIXELSIZE == 3
+  TJPF_BGR,
+#elif RGB_RED == 0 && RGB_GREEN == 1 && RGB_BLUE == 2 && RGB_PIXELSIZE == 4
+  TJPF_RGBX,
+#elif RGB_RED == 2 && RGB_GREEN == 1 && RGB_BLUE == 0 && RGB_PIXELSIZE == 4
+  TJPF_BGRX,
+#elif RGB_RED == 3 && RGB_GREEN == 2 && RGB_BLUE == 1 && RGB_PIXELSIZE == 4
+  TJPF_XBGR,
+#elif RGB_RED == 1 && RGB_GREEN == 2 && RGB_BLUE == 3 && RGB_PIXELSIZE == 4
+  TJPF_XRGB,
+#endif
+  TJPF_UNKNOWN, TJPF_CMYK, TJPF_UNKNOWN, TJPF_RGB, TJPF_RGBX, TJPF_BGR,
+  TJPF_BGRX, TJPF_XBGR, TJPF_XRGB, TJPF_RGBA, TJPF_BGRA, TJPF_ABGR, TJPF_ARGB,
+  TJPF_UNKNOWN
+};
+
+#else
+
+static J_COLOR_SPACE pf2cs[TJ_NUMPF] = {
+  JCS_RGB, JCS_RGB, JCS_RGB, JCS_RGB, JCS_RGB, JCS_RGB, JCS_GRAYSCALE,
+  JCS_RGB, JCS_RGB, JCS_RGB, JCS_RGB, JCS_CMYK
+};
+
+static int cs2pf[6] = {
+  TJPF_UNKNOWN, TJPF_GRAY, TJPF_RGB, TJPF_UNKNOWN, TJPF_CMYK, TJPF_UNKNOWN
+};
+
+#endif
+
+#define THROWG(m) { \
+  SNPRINTF(errStr, JMSG_LENGTH_MAX, "%s", m); \
+  retval = -1;  goto bailout; \
+}
+#ifdef _MSC_VER
+#define THROW_UNIX(m) { \
+  char strerrorBuf[80] = { 0 }; \
+  strerror_s(strerrorBuf, 80, errno); \
+  SNPRINTF(errStr, JMSG_LENGTH_MAX, "%s\n%s", m, strerrorBuf); \
+  retval = -1;  goto bailout; \
+}
+#else
+#define THROW_UNIX(m) { \
+  SNPRINTF(errStr, JMSG_LENGTH_MAX, "%s\n%s", m, strerror(errno)); \
+  retval = -1;  goto bailout; \
+}
+#endif
+#define THROW(m) { \
+  SNPRINTF(this->errStr, JMSG_LENGTH_MAX, "%s", m); \
+  this->isInstanceError = TRUE;  THROWG(m) \
+}
+
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+/* Private flag that triggers different TurboJPEG API behavior when fuzzing */
+#define TJFLAG_FUZZING  (1 << 30)
+#endif
+
+#define GET_INSTANCE(handle) \
+  tjinstance *this = (tjinstance *)handle; \
+  j_compress_ptr cinfo = NULL; \
+  j_decompress_ptr dinfo = NULL; \
+  \
+  if (!this) { \
+    SNPRINTF(errStr, JMSG_LENGTH_MAX, "Invalid handle"); \
+    return -1; \
+  } \
+  cinfo = &this->cinfo;  dinfo = &this->dinfo; \
+  this->jerr.warning = FALSE; \
+  this->isInstanceError = FALSE;
+
+#define GET_CINSTANCE(handle) \
+  tjinstance *this = (tjinstance *)handle; \
+  j_compress_ptr cinfo = NULL; \
+  \
+  if (!this) { \
+    SNPRINTF(errStr, JMSG_LENGTH_MAX, "Invalid handle"); \
+    return -1; \
+  } \
+  cinfo = &this->cinfo; \
+  this->jerr.warning = FALSE; \
+  this->isInstanceError = FALSE;
+
+#define GET_DINSTANCE(handle) \
+  tjinstance *this = (tjinstance *)handle; \
+  j_decompress_ptr dinfo = NULL; \
+  \
+  if (!this) { \
+    SNPRINTF(errStr, JMSG_LENGTH_MAX, "Invalid handle"); \
+    return -1; \
+  } \
+  dinfo = &this->dinfo; \
+  this->jerr.warning = FALSE; \
+  this->isInstanceError = FALSE;
 
 static int getPixelFormat(int pixelSize, int flags)
 {
-	if(pixelSize==1) return TJPF_GRAY;
-	if(pixelSize==3)
-	{
-		if(flags&TJ_BGR) return TJPF_BGR;
-		else return TJPF_RGB;
-	}
-	if(pixelSize==4)
-	{
-		if(flags&TJ_ALPHAFIRST)
-		{
-			if(flags&TJ_BGR) return TJPF_XBGR;
-			else return TJPF_XRGB;
-		}
-		else
-		{
-			if(flags&TJ_BGR) return TJPF_BGRX;
-			else return TJPF_RGBX;
-		}
-	}
-	return -1;
+  if (pixelSize == 1) return TJPF_GRAY;
+  if (pixelSize == 3) {
+    if (flags & TJ_BGR) return TJPF_BGR;
+    else return TJPF_RGB;
+  }
+  if (pixelSize == 4) {
+    if (flags & TJ_ALPHAFIRST) {
+      if (flags & TJ_BGR) return TJPF_XBGR;
+      else return TJPF_XRGB;
+    } else {
+      if (flags & TJ_BGR) return TJPF_BGRX;
+      else return TJPF_RGBX;
+    }
+  }
+  return -1;
 }
 
-static int setCompDefaults(struct jpeg_compress_struct *cinfo,
-	int pixelFormat, int subsamp, int jpegQual, int flags)
+static void setCompDefaults(struct jpeg_compress_struct *cinfo,
+                            int pixelFormat, int subsamp, int jpegQual,
+                            int flags)
 {
-	int retval=0;
-	char *env=NULL;
-
-	switch(pixelFormat)
-	{
-		case TJPF_GRAY:
-			cinfo->in_color_space=JCS_GRAYSCALE;  break;
-		#if JCS_EXTENSIONS==1
-		case TJPF_RGB:
-			cinfo->in_color_space=JCS_EXT_RGB;  break;
-		case TJPF_BGR:
-			cinfo->in_color_space=JCS_EXT_BGR;  break;
-		case TJPF_RGBX:
-		case TJPF_RGBA:
-			cinfo->in_color_space=JCS_EXT_RGBX;  break;
-		case TJPF_BGRX:
-		case TJPF_BGRA:
-			cinfo->in_color_space=JCS_EXT_BGRX;  break;
-		case TJPF_XRGB:
-		case TJPF_ARGB:
-			cinfo->in_color_space=JCS_EXT_XRGB;  break;
-		case TJPF_XBGR:
-		case TJPF_ABGR:
-			cinfo->in_color_space=JCS_EXT_XBGR;  break;
-		#else
-		case TJPF_RGB:
-		case TJPF_BGR:
-		case TJPF_RGBX:
-		case TJPF_BGRX:
-		case TJPF_XRGB:
-		case TJPF_XBGR:
-		case TJPF_RGBA:
-		case TJPF_BGRA:
-		case TJPF_ARGB:
-		case TJPF_ABGR:
-			cinfo->in_color_space=JCS_RGB;  pixelFormat=TJPF_RGB;
-			break;
-		#endif
-	}
-
-	cinfo->input_components=tjPixelSize[pixelFormat];
-	jpeg_set_defaults(cinfo);
-	if(jpegQual>=0)
-	{
-		jpeg_set_quality(cinfo, jpegQual, TRUE);
-		if(jpegQual>=96 || flags&TJFLAG_ACCURATEDCT) cinfo->dct_method=JDCT_ISLOW;
-		else cinfo->dct_method=JDCT_FASTEST;
-	}
-	if(subsamp==TJSAMP_GRAY)
-		jpeg_set_colorspace(cinfo, JCS_GRAYSCALE);
-	else
-		jpeg_set_colorspace(cinfo, JCS_YCbCr);
-
-	if(flags&TJFLAG_PROGRESSIVE)
-		jpeg_simple_progression(cinfo);
 #ifndef NO_GETENV
-	else if((env=getenv("TJ_PROGRESSIVE"))!=NULL && strlen(env)>0
-		&& !strcmp(env, "1"))
-		jpeg_simple_progression(cinfo);
+  char env[7] = { 0 };
 #endif
 
-	cinfo->comp_info[0].h_samp_factor=tjMCUWidth[subsamp]/8;
-	cinfo->comp_info[1].h_samp_factor=1;
-	cinfo->comp_info[2].h_samp_factor=1;
-	cinfo->comp_info[0].v_samp_factor=tjMCUHeight[subsamp]/8;
-	cinfo->comp_info[1].v_samp_factor=1;
-	cinfo->comp_info[2].v_samp_factor=1;
+  cinfo->in_color_space = pf2cs[pixelFormat];
+  cinfo->input_components = tjPixelSize[pixelFormat];
+  jpeg_set_defaults(cinfo);
 
-	return retval;
-}
+#ifndef NO_GETENV
+  if (!GETENV_S(env, 7, "TJ_OPTIMIZE") && !strcmp(env, "1"))
+    cinfo->optimize_coding = TRUE;
+  if (!GETENV_S(env, 7, "TJ_ARITHMETIC") && !strcmp(env, "1"))
+    cinfo->arith_code = TRUE;
+  if (!GETENV_S(env, 7, "TJ_RESTART") && strlen(env) > 0) {
+    int temp = -1;
+    char tempc = 0;
 
-static int setDecompDefaults(struct jpeg_decompress_struct *dinfo,
-	int pixelFormat, int flags)
-{
-	int retval=0;
+#ifdef _MSC_VER
+    if (sscanf_s(env, "%d%c", &temp, &tempc, 1) >= 1 && temp >= 0 &&
+        temp <= 65535) {
+#else
+    if (sscanf(env, "%d%c", &temp, &tempc) >= 1 && temp >= 0 &&
+        temp <= 65535) {
+#endif
+      if (toupper(tempc) == 'B') {
+        cinfo->restart_interval = temp;
+        cinfo->restart_in_rows = 0;
+      } else
+        cinfo->restart_in_rows = temp;
+    }
+  }
+#endif
 
-	switch(pixelFormat)
-	{
-		case TJPF_GRAY:
-			dinfo->out_color_space=JCS_GRAYSCALE;  break;
-		#if JCS_EXTENSIONS==1
-		case TJPF_RGB:
-			dinfo->out_color_space=JCS_EXT_RGB;  break;
-		case TJPF_BGR:
-			dinfo->out_color_space=JCS_EXT_BGR;  break;
-		case TJPF_RGBX:
-			dinfo->out_color_space=JCS_EXT_RGBX;  break;
-		case TJPF_BGRX:
-			dinfo->out_color_space=JCS_EXT_BGRX;  break;
-		case TJPF_XRGB:
-			dinfo->out_color_space=JCS_EXT_XRGB;  break;
-		case TJPF_XBGR:
-			dinfo->out_color_space=JCS_EXT_XBGR;  break;
-		#if JCS_ALPHA_EXTENSIONS==1
-		case TJPF_RGBA:
-			dinfo->out_color_space=JCS_EXT_RGBA;  break;
-		case TJPF_BGRA:
-			dinfo->out_color_space=JCS_EXT_BGRA;  break;
-		case TJPF_ARGB:
-			dinfo->out_color_space=JCS_EXT_ARGB;  break;
-		case TJPF_ABGR:
-			dinfo->out_color_space=JCS_EXT_ABGR;  break;
-		#endif
-		#else
-		case TJPF_RGB:
-		case TJPF_BGR:
-		case TJPF_RGBX:
-		case TJPF_BGRX:
-		case TJPF_XRGB:
-		case TJPF_XBGR:
-		case TJPF_RGBA:
-		case TJPF_BGRA:
-		case TJPF_ARGB:
-		case TJPF_ABGR:
-			dinfo->out_color_space=JCS_RGB;  break;
-		#endif
-		default:
-			_throw("Unsupported pixel format");
-	}
+  if (jpegQual >= 0) {
+    jpeg_set_quality(cinfo, jpegQual, TRUE);
+    if (jpegQual >= 96 || flags & TJFLAG_ACCURATEDCT)
+      cinfo->dct_method = JDCT_ISLOW;
+    else
+      cinfo->dct_method = JDCT_FASTEST;
+  }
+  if (subsamp == TJSAMP_GRAY)
+    jpeg_set_colorspace(cinfo, JCS_GRAYSCALE);
+  else if (pixelFormat == TJPF_CMYK)
+    jpeg_set_colorspace(cinfo, JCS_YCCK);
+  else
+    jpeg_set_colorspace(cinfo, JCS_YCbCr);
 
-	if(flags&TJFLAG_FASTDCT) dinfo->dct_method=JDCT_FASTEST;
+#ifdef C_PROGRESSIVE_SUPPORTED
+  if (flags & TJFLAG_PROGRESSIVE)
+    jpeg_simple_progression(cinfo);
+#ifndef NO_GETENV
+  else if (!GETENV_S(env, 7, "TJ_PROGRESSIVE") && !strcmp(env, "1"))
+    jpeg_simple_progression(cinfo);
+#endif
+#endif
 
-	bailout:
-	return retval;
+  cinfo->comp_info[0].h_samp_factor = tjMCUWidth[subsamp] / 8;
+  cinfo->comp_info[1].h_samp_factor = 1;
+  cinfo->comp_info[2].h_samp_factor = 1;
+  if (cinfo->num_components > 3)
+    cinfo->comp_info[3].h_samp_factor = tjMCUWidth[subsamp] / 8;
+  cinfo->comp_info[0].v_samp_factor = tjMCUHeight[subsamp] / 8;
+  cinfo->comp_info[1].v_samp_factor = 1;
+  cinfo->comp_info[2].v_samp_factor = 1;
+  if (cinfo->num_components > 3)
+    cinfo->comp_info[3].v_samp_factor = tjMCUHeight[subsamp] / 8;
 }
 
 
 static int getSubsamp(j_decompress_ptr dinfo)
 {
-	int retval=-1, i, k;
-	for(i=0; i<NUMSUBOPT; i++)
-	{
-		if(dinfo->num_components==pixelsize[i])
-		{
-			if(dinfo->comp_info[0].h_samp_factor==tjMCUWidth[i]/8
-				&& dinfo->comp_info[0].v_samp_factor==tjMCUHeight[i]/8)
-			{
-				int match=0;
-				for(k=1; k<dinfo->num_components; k++)
-				{
-					if(dinfo->comp_info[k].h_samp_factor==1
-						&& dinfo->comp_info[k].v_samp_factor==1)
-						match++;
-				}
-				if(match==dinfo->num_components-1)
-				{
-					retval=i;  break;
-				}
-			}
-		}
-	}
-	return retval;
+  int retval = -1, i, k;
+
+  /* The sampling factors actually have no meaning with grayscale JPEG files,
+     and in fact it's possible to generate grayscale JPEGs with sampling
+     factors > 1 (even though those sampling factors are ignored by the
+     decompressor.)  Thus, we need to treat grayscale as a special case. */
+  if (dinfo->num_components == 1 && dinfo->jpeg_color_space == JCS_GRAYSCALE)
+    return TJSAMP_GRAY;
+
+  for (i = 0; i < TJ_NUMSAMP; i++) {
+    if (dinfo->num_components == pixelsize[i] ||
+        ((dinfo->jpeg_color_space == JCS_YCCK ||
+          dinfo->jpeg_color_space == JCS_CMYK) &&
+         pixelsize[i] == 3 && dinfo->num_components == 4)) {
+      if (dinfo->comp_info[0].h_samp_factor == tjMCUWidth[i] / 8 &&
+          dinfo->comp_info[0].v_samp_factor == tjMCUHeight[i] / 8) {
+        int match = 0;
+
+        for (k = 1; k < dinfo->num_components; k++) {
+          int href = 1, vref = 1;
+
+          if ((dinfo->jpeg_color_space == JCS_YCCK ||
+               dinfo->jpeg_color_space == JCS_CMYK) && k == 3) {
+            href = tjMCUWidth[i] / 8;  vref = tjMCUHeight[i] / 8;
+          }
+          if (dinfo->comp_info[k].h_samp_factor == href &&
+              dinfo->comp_info[k].v_samp_factor == vref)
+            match++;
+        }
+        if (match == dinfo->num_components - 1) {
+          retval = i;  break;
+        }
+      }
+      /* Handle 4:2:2 and 4:4:0 images whose sampling factors are specified
+         in non-standard ways. */
+      if (dinfo->comp_info[0].h_samp_factor == 2 &&
+          dinfo->comp_info[0].v_samp_factor == 2 &&
+          (i == TJSAMP_422 || i == TJSAMP_440)) {
+        int match = 0;
+
+        for (k = 1; k < dinfo->num_components; k++) {
+          int href = tjMCUHeight[i] / 8, vref = tjMCUWidth[i] / 8;
+
+          if ((dinfo->jpeg_color_space == JCS_YCCK ||
+               dinfo->jpeg_color_space == JCS_CMYK) && k == 3) {
+            href = vref = 2;
+          }
+          if (dinfo->comp_info[k].h_samp_factor == href &&
+              dinfo->comp_info[k].v_samp_factor == vref)
+            match++;
+        }
+        if (match == dinfo->num_components - 1) {
+          retval = i;  break;
+        }
+      }
+      /* Handle 4:4:4 images whose sampling factors are specified in
+         non-standard ways. */
+      if (dinfo->comp_info[0].h_samp_factor *
+          dinfo->comp_info[0].v_samp_factor <=
+          D_MAX_BLOCKS_IN_MCU / pixelsize[i] && i == TJSAMP_444) {
+        int match = 0;
+        for (k = 1; k < dinfo->num_components; k++) {
+          if (dinfo->comp_info[k].h_samp_factor ==
+              dinfo->comp_info[0].h_samp_factor &&
+              dinfo->comp_info[k].v_samp_factor ==
+              dinfo->comp_info[0].v_samp_factor)
+            match++;
+          if (match == dinfo->num_components - 1) {
+            retval = i;  break;
+          }
+        }
+      }
+    }
+  }
+  return retval;
 }
 
 
 #ifndef JCS_EXTENSIONS
 
 /* Conversion functions to emulate the colorspace extensions.  This allows the
-   TurboJPEG wrapper to be used with libjpeg */
+   TurboJPEG API to be used with libjpeg. */
 
-#define TORGB(PS, ROFFSET, GOFFSET, BOFFSET) {  \
-	int rowPad=pitch-width*PS;  \
-	while(height--)  \
-	{  \
-		unsigned char *endOfRow=src+width*PS;  \
-		while(src<endOfRow)  \
-		{  \
-			dst[RGB_RED]=src[ROFFSET];  \
-			dst[RGB_GREEN]=src[GOFFSET];  \
-			dst[RGB_BLUE]=src[BOFFSET];  \
-			dst+=RGB_PIXELSIZE;  src+=PS;  \
-		}  \
-		src+=rowPad;  \
-	}  \
-}
-
-static unsigned char *toRGB(unsigned char *src, int width, int pitch,
-	int height, int pixelFormat, unsigned char *dst)
+static INLINE unsigned char *toRGB(unsigned char *src, int width, int pitch,
+                                   int height, int srcPixelFormat,
+                                   unsigned char *dst, int dstRedOffset,
+                                   int dstGreenOffset, int dstBlueOffset,
+                                   int dstPixelSize)
 {
-	unsigned char *retval=src;
-	switch(pixelFormat)
-	{
-		case TJPF_RGB:
-			#if RGB_RED!=0 || RGB_GREEN!=1 || RGB_BLUE!=2 || RGB_PIXELSIZE!=3
-			retval=dst;  TORGB(3, 0, 1, 2);
-			#endif
-			break;
-		case TJPF_BGR:
-			#if RGB_RED!=2 || RGB_GREEN!=1 || RGB_BLUE!=0 || RGB_PIXELSIZE!=3
-			retval=dst;  TORGB(3, 2, 1, 0);
-			#endif
-			break;
-		case TJPF_RGBX:
-		case TJPF_RGBA:
-			#if RGB_RED!=0 || RGB_GREEN!=1 || RGB_BLUE!=2 || RGB_PIXELSIZE!=4
-			retval=dst;  TORGB(4, 0, 1, 2);
-			#endif
-			break;
-		case TJPF_BGRX:
-		case TJPF_BGRA:
-			#if RGB_RED!=2 || RGB_GREEN!=1 || RGB_BLUE!=0 || RGB_PIXELSIZE!=4
-			retval=dst;  TORGB(4, 2, 1, 0);
-			#endif
-			break;
-		case TJPF_XRGB:
-		case TJPF_ARGB:
-			#if RGB_RED!=1 || RGB_GREEN!=2 || RGB_BLUE!=3 || RGB_PIXELSIZE!=4
-			retval=dst;  TORGB(4, 1, 2, 3);
-			#endif
-			break;
-		case TJPF_XBGR:
-		case TJPF_ABGR:
-			#if RGB_RED!=3 || RGB_GREEN!=2 || RGB_BLUE!=1 || RGB_PIXELSIZE!=4
-			retval=dst;  TORGB(4, 3, 2, 1);
-			#endif
-			break;
-	}
-	return retval;
+  unsigned char *retval = src;
+  int srcRedOffset = tjRedOffset[srcPixelFormat];
+  int srcGreenOffset = tjGreenOffset[srcPixelFormat];
+  int srcBlueOffset = tjBlueOffset[srcPixelFormat];
+  int srcPixelSize = tjPixelSize[srcPixelFormat];
+
+  if (dstRedOffset != srcRedOffset || dstGreenOffset != srcGreenOffset ||
+      dstBlueOffset != srcBlueOffset || dstPixelSize != srcPixelSize) {
+    int rowPad = pitch - width * srcPixelSize;
+
+    retval = dst;
+
+    while (height--) {
+      unsigned char *endOfRow = src + width * srcPixelSize;
+
+      while (src < endOfRow) {
+        dst[dstRedOffset] = src[srcRedOffset];
+        dst[dstGreenOffset] = src[srcGreenOffset];
+        dst[dstBlueOffset] = src[srcBlueOffset];
+        dst += dstPixelSize;  src += srcPixelSize;
+      }
+      src += rowPad;
+    }
+  }
+
+  return retval;
 }
 
-#define FROMRGB(PS, ROFFSET, GOFFSET, BOFFSET, SETALPHA) {  \
-	int rowPad=pitch-width*PS;  \
-	while(height--)  \
-	{  \
-		unsigned char *endOfRow=dst+width*PS;  \
-		while(dst<endOfRow)  \
-		{  \
-			dst[ROFFSET]=src[RGB_RED];  \
-			dst[GOFFSET]=src[RGB_GREEN];  \
-			dst[BOFFSET]=src[RGB_BLUE];  \
-			SETALPHA  \
-			dst+=PS;  src+=RGB_PIXELSIZE;  \
-		}  \
-		dst+=rowPad;  \
-	}  \
-}
-
-static void fromRGB(unsigned char *src, unsigned char *dst, int width,
-	int pitch, int height, int pixelFormat)
+static INLINE void fromRGB(unsigned char *src, int srcRedOffset,
+                           int srcGreenOffset, int srcBlueOffset,
+                           int srcPixelSize, unsigned char *dst, int width,
+                           int pitch, int height, int dstPixelFormat)
 {
-	switch(pixelFormat)
-	{
-		case TJPF_RGB:
-			#if RGB_RED!=0 || RGB_GREEN!=1 || RGB_BLUE!=2 || RGB_PIXELSIZE!=3
-			FROMRGB(3, 0, 1, 2,);
-			#endif
-			break;
-		case TJPF_BGR:
-			#if RGB_RED!=2 || RGB_GREEN!=1 || RGB_BLUE!=0 || RGB_PIXELSIZE!=3
-			FROMRGB(3, 2, 1, 0,);
-			#endif
-			break;
-		case TJPF_RGBX:
-			#if RGB_RED!=0 || RGB_GREEN!=1 || RGB_BLUE!=2 || RGB_PIXELSIZE!=4
-			FROMRGB(4, 0, 1, 2,);
-			#endif
-			break;
-		case TJPF_RGBA:
-			#if RGB_RED!=0 || RGB_GREEN!=1 || RGB_BLUE!=2 || RGB_PIXELSIZE!=4
-			FROMRGB(4, 0, 1, 2, dst[3]=0xFF;);
-			#endif
-			break;
-		case TJPF_BGRX:
-			#if RGB_RED!=2 || RGB_GREEN!=1 || RGB_BLUE!=0 || RGB_PIXELSIZE!=4
-			FROMRGB(4, 2, 1, 0,);
-			#endif
-			break;
-		case TJPF_BGRA:
-			#if RGB_RED!=2 || RGB_GREEN!=1 || RGB_BLUE!=0 || RGB_PIXELSIZE!=4
-			FROMRGB(4, 2, 1, 0, dst[3]=0xFF;);  return;
-			#endif
-			break;
-		case TJPF_XRGB:
-			#if RGB_RED!=1 || RGB_GREEN!=2 || RGB_BLUE!=3 || RGB_PIXELSIZE!=4
-			FROMRGB(4, 1, 2, 3,);  return;
-			#endif
-			break;
-		case TJPF_ARGB:
-			#if RGB_RED!=1 || RGB_GREEN!=2 || RGB_BLUE!=3 || RGB_PIXELSIZE!=4
-			FROMRGB(4, 1, 2, 3, dst[0]=0xFF;);  return;
-			#endif
-			break;
-		case TJPF_XBGR:
-			#if RGB_RED!=3 || RGB_GREEN!=2 || RGB_BLUE!=1 || RGB_PIXELSIZE!=4
-			FROMRGB(4, 3, 2, 1,);  return;
-			#endif
-			break;
-		case TJPF_ABGR:
-			#if RGB_RED!=3 || RGB_GREEN!=2 || RGB_BLUE!=1 || RGB_PIXELSIZE!=4
-			FROMRGB(4, 3, 2, 1, dst[0]=0xFF;);  return;
-			#endif
-			break;
-	}
+  int dstRedOffset = tjRedOffset[dstPixelFormat];
+  int dstGreenOffset = tjGreenOffset[dstPixelFormat];
+  int dstBlueOffset = tjBlueOffset[dstPixelFormat];
+  int dstAlphaOffset = tjAlphaOffset[dstPixelFormat];
+  int dstPixelSize = tjPixelSize[dstPixelFormat];
+
+  if (srcRedOffset != dstRedOffset || srcGreenOffset != dstGreenOffset ||
+      srcBlueOffset != dstBlueOffset || srcPixelSize != dstPixelSize ||
+      dstAlphaOffset >= 0) {
+    int rowPad = pitch - width * dstPixelSize;
+
+    while (height--) {
+      unsigned char *endOfRow = dst + width * dstPixelSize;
+
+      while (dst < endOfRow) {
+        dst[dstRedOffset] = src[srcRedOffset];
+        dst[dstGreenOffset] = src[srcGreenOffset];
+        dst[dstBlueOffset] = src[srcBlueOffset];
+        if (dstAlphaOffset >= 0)
+          dst[dstAlphaOffset] = 0xFF;
+        dst += dstPixelSize;  src += srcPixelSize;
+      }
+      dst += rowPad;
+    }
+  }
 }
 
 #endif
 
 
-/* General API functions */
+/*************************** General API functions ***************************/
 
-DLLEXPORT char* DLLCALL tjGetErrorStr(void)
+/* TurboJPEG 2.0+ */
+DLLEXPORT char *tjGetErrorStr2(tjhandle handle)
 {
-	return errStr;
+  tjinstance *this = (tjinstance *)handle;
+
+  if (this && this->isInstanceError) {
+    this->isInstanceError = FALSE;
+    return this->errStr;
+  } else
+    return errStr;
 }
 
 
-DLLEXPORT int DLLCALL tjDestroy(tjhandle handle)
+/* TurboJPEG 1.0+ */
+DLLEXPORT char *tjGetErrorStr(void)
 {
-	getinstance(handle);
-	if(setjmp(this->jerr.setjmp_buffer)) return -1;
-	if(this->init&COMPRESS) jpeg_destroy_compress(cinfo);
-	if(this->init&DECOMPRESS) jpeg_destroy_decompress(dinfo);
-	free(this);
-	return 0;
+  return errStr;
+}
+
+
+/* TurboJPEG 2.0+ */
+DLLEXPORT int tjGetErrorCode(tjhandle handle)
+{
+  tjinstance *this = (tjinstance *)handle;
+
+  if (this && this->jerr.warning) return TJERR_WARNING;
+  else return TJERR_FATAL;
+}
+
+
+/* TurboJPEG 1.0+ */
+DLLEXPORT int tjDestroy(tjhandle handle)
+{
+  GET_INSTANCE(handle);
+
+  if (setjmp(this->jerr.setjmp_buffer)) return -1;
+  if (this->init & COMPRESS) jpeg_destroy_compress(cinfo);
+  if (this->init & DECOMPRESS) jpeg_destroy_decompress(dinfo);
+  free(this);
+  return 0;
 }
 
 
@@ -458,882 +591,2066 @@ DLLEXPORT int DLLCALL tjDestroy(tjhandle handle)
    with turbojpeg.dll for compatibility reasons.  However, these functions
    can potentially be used for other purposes by different implementations. */
 
-DLLEXPORT void DLLCALL tjFree(unsigned char *buf)
+/* TurboJPEG 1.2+ */
+DLLEXPORT void tjFree(unsigned char *buf)
 {
-	if(buf) free(buf);
+  free(buf);
+}
+
+/* TurboJPEG 1.2+ */
+DLLEXPORT unsigned char *tjAlloc(int bytes)
+{
+  return (unsigned char *)MALLOC(bytes);
 }
 
 
-DLLEXPORT unsigned char *DLLCALL tjAlloc(int bytes)
-{
-	return (unsigned char *)malloc(bytes);
-}
-
-
-/* Compressor  */
+/******************************** Compressor *********************************/
 
 static tjhandle _tjInitCompress(tjinstance *this)
 {
-	unsigned char buffer[1], *buf=buffer;  unsigned long size=1;
+  static unsigned char buffer[1];
+  unsigned char *buf = buffer;
+  unsigned long size = 1;
 
-	/* This is also straight out of example.c */
-	this->cinfo.err=jpeg_std_error(&this->jerr.pub);
-	this->jerr.pub.error_exit=my_error_exit;
-	this->jerr.pub.output_message=my_output_message;
+  /* This is also straight out of example.txt */
+  this->cinfo.err = jpeg_std_error(&this->jerr.pub);
+  this->jerr.pub.error_exit = my_error_exit;
+  this->jerr.pub.output_message = my_output_message;
+  this->jerr.emit_message = this->jerr.pub.emit_message;
+  this->jerr.pub.emit_message = my_emit_message;
+  this->jerr.pub.addon_message_table = turbojpeg_message_table;
+  this->jerr.pub.first_addon_message = JMSG_FIRSTADDONCODE;
+  this->jerr.pub.last_addon_message = JMSG_LASTADDONCODE;
 
-	if(setjmp(this->jerr.setjmp_buffer))
-	{
-		/* If we get here, the JPEG code has signaled an error. */
-		if(this) free(this);  return NULL;
-	}
+  if (setjmp(this->jerr.setjmp_buffer)) {
+    /* If we get here, the JPEG code has signaled an error. */
+    free(this);
+    return NULL;
+  }
 
-	jpeg_create_compress(&this->cinfo);
-	/* Make an initial call so it will create the destination manager */
-	jpeg_mem_dest_tj(&this->cinfo, &buf, &size, 0);
+  jpeg_create_compress(&this->cinfo);
+  /* Make an initial call so it will create the destination manager */
+  jpeg_mem_dest_tj(&this->cinfo, &buf, &size, 0);
 
-	this->init|=COMPRESS;
-	return (tjhandle)this;
+  this->init |= COMPRESS;
+  return (tjhandle)this;
 }
 
-DLLEXPORT tjhandle DLLCALL tjInitCompress(void)
+/* TurboJPEG 1.0+ */
+DLLEXPORT tjhandle tjInitCompress(void)
 {
-	tjinstance *this=NULL;
-	if((this=(tjinstance *)malloc(sizeof(tjinstance)))==NULL)
-	{
-		snprintf(errStr, JMSG_LENGTH_MAX,
-			"tjInitCompress(): Memory allocation failure");
-		return NULL;
-	}
-	MEMZERO(this, sizeof(tjinstance));
-	return _tjInitCompress(this);
+  tjinstance *this = NULL;
+
+  if ((this = (tjinstance *)malloc(sizeof(tjinstance))) == NULL) {
+    SNPRINTF(errStr, JMSG_LENGTH_MAX,
+             "tjInitCompress(): Memory allocation failure");
+    return NULL;
+  }
+  memset(this, 0, sizeof(tjinstance));
+  SNPRINTF(this->errStr, JMSG_LENGTH_MAX, "No error");
+  return _tjInitCompress(this);
 }
 
 
-DLLEXPORT unsigned long DLLCALL tjBufSize(int width, int height,
-	int jpegSubsamp)
+/* TurboJPEG 1.2+ */
+DLLEXPORT unsigned long tjBufSize(int width, int height, int jpegSubsamp)
 {
-	unsigned long retval=0;  int mcuw, mcuh, chromasf;
-	if(width<1 || height<1 || jpegSubsamp<0 || jpegSubsamp>=NUMSUBOPT)
-		_throw("tjBufSize(): Invalid argument");
+  unsigned long long retval = 0;
+  int mcuw, mcuh, chromasf;
 
-	/* This allows for rare corner cases in which a JPEG image can actually be
-	   larger than the uncompressed input (we wouldn't mention it if it hadn't
-	   happened before.) */
-	mcuw=tjMCUWidth[jpegSubsamp];
-	mcuh=tjMCUHeight[jpegSubsamp];
-	chromasf=jpegSubsamp==TJSAMP_GRAY? 0: 4*64/(mcuw*mcuh);
-	retval=PAD(width, mcuw) * PAD(height, mcuh) * (2 + chromasf) + 2048;
+  if (width < 1 || height < 1 || jpegSubsamp < 0 || jpegSubsamp >= TJ_NUMSAMP)
+    THROWG("tjBufSize(): Invalid argument");
 
-	bailout:
-	return retval;
+  /* This allows for rare corner cases in which a JPEG image can actually be
+     larger than the uncompressed input (we wouldn't mention it if it hadn't
+     happened before.) */
+  mcuw = tjMCUWidth[jpegSubsamp];
+  mcuh = tjMCUHeight[jpegSubsamp];
+  chromasf = jpegSubsamp == TJSAMP_GRAY ? 0 : 4 * 64 / (mcuw * mcuh);
+  retval = PAD(width, mcuw) * PAD(height, mcuh) * (2ULL + chromasf) + 2048ULL;
+#if ULLONG_MAX > ULONG_MAX
+  if (retval > (unsigned long long)((unsigned long)-1))
+    THROWG("tjBufSize(): Image is too large");
+#endif
+
+bailout:
+  return (unsigned long)retval;
 }
 
-DLLEXPORT unsigned long DLLCALL TJBUFSIZE(int width, int height)
+/* TurboJPEG 1.0+ */
+DLLEXPORT unsigned long TJBUFSIZE(int width, int height)
 {
-	unsigned long retval=0;
-	if(width<1 || height<1)
-		_throw("TJBUFSIZE(): Invalid argument");
+  unsigned long long retval = 0;
 
-	/* This allows for rare corner cases in which a JPEG image can actually be
-	   larger than the uncompressed input (we wouldn't mention it if it hadn't
-	   happened before.) */
-	retval=PAD(width, 16) * PAD(height, 16) * 6 + 2048;
+  if (width < 1 || height < 1)
+    THROWG("TJBUFSIZE(): Invalid argument");
 
-	bailout:
-	return retval;
+  /* This allows for rare corner cases in which a JPEG image can actually be
+     larger than the uncompressed input (we wouldn't mention it if it hadn't
+     happened before.) */
+  retval = PAD(width, 16) * PAD(height, 16) * 6ULL + 2048ULL;
+#if ULLONG_MAX > ULONG_MAX
+  if (retval > (unsigned long long)((unsigned long)-1))
+    THROWG("TJBUFSIZE(): Image is too large");
+#endif
+
+bailout:
+  return (unsigned long)retval;
 }
 
 
-DLLEXPORT unsigned long DLLCALL tjBufSizeYUV(int width, int height,
-	int subsamp)
+/* TurboJPEG 1.4+ */
+DLLEXPORT unsigned long tjBufSizeYUV2(int width, int align, int height,
+                                      int subsamp)
 {
-	unsigned long retval=0;
-	int pw, ph, cw, ch;
-	if(width<1 || height<1 || subsamp<0 || subsamp>=NUMSUBOPT)
-		_throw("tjBufSizeYUV(): Invalid argument");
-	pw=PAD(width, tjMCUWidth[subsamp]/8);
-	ph=PAD(height, tjMCUHeight[subsamp]/8);
-	cw=pw*8/tjMCUWidth[subsamp];  ch=ph*8/tjMCUHeight[subsamp];
-	retval=PAD(pw, 4)*ph + (subsamp==TJSAMP_GRAY? 0:PAD(cw, 4)*ch*2);
+  unsigned long long retval = 0;
+  int nc, i;
 
-	bailout:
-	return retval;
+  if (align < 1 || !IS_POW2(align) || subsamp < 0 || subsamp >= TJ_NUMSAMP)
+    THROWG("tjBufSizeYUV2(): Invalid argument");
+
+  nc = (subsamp == TJSAMP_GRAY ? 1 : 3);
+  for (i = 0; i < nc; i++) {
+    int pw = tjPlaneWidth(i, width, subsamp);
+    int stride = PAD(pw, align);
+    int ph = tjPlaneHeight(i, height, subsamp);
+
+    if (pw < 0 || ph < 0) return -1;
+    else retval += (unsigned long long)stride * ph;
+  }
+#if ULLONG_MAX > ULONG_MAX
+  if (retval > (unsigned long long)((unsigned long)-1))
+    THROWG("tjBufSizeYUV2(): Image is too large");
+#endif
+
+bailout:
+  return (unsigned long)retval;
 }
 
-
-DLLEXPORT unsigned long DLLCALL TJBUFSIZEYUV(int width, int height,
-	int subsamp)
+/* TurboJPEG 1.2+ */
+DLLEXPORT unsigned long tjBufSizeYUV(int width, int height, int subsamp)
 {
-	return tjBufSizeYUV(width, height, subsamp);
+  return tjBufSizeYUV2(width, 4, height, subsamp);
 }
 
-
-DLLEXPORT int DLLCALL tjCompress2(tjhandle handle, unsigned char *srcBuf,
-	int width, int pitch, int height, int pixelFormat, unsigned char **jpegBuf,
-	unsigned long *jpegSize, int jpegSubsamp, int jpegQual, int flags)
+/* TurboJPEG 1.1+ */
+DLLEXPORT unsigned long TJBUFSIZEYUV(int width, int height, int subsamp)
 {
-	int i, retval=0, alloc=1;  JSAMPROW *row_pointer=NULL;
-	#ifndef JCS_EXTENSIONS
-	unsigned char *rgbBuf=NULL;
-	#endif
-
-	getinstance(handle)
-	if((this->init&COMPRESS)==0)
-		_throw("tjCompress2(): Instance has not been initialized for compression");
-
-	if(srcBuf==NULL || width<=0 || pitch<0 || height<=0 || pixelFormat<0
-		|| pixelFormat>=TJ_NUMPF || jpegBuf==NULL || jpegSize==NULL
-		|| jpegSubsamp<0 || jpegSubsamp>=NUMSUBOPT || jpegQual<0 || jpegQual>100)
-		_throw("tjCompress2(): Invalid argument");
-
-	if(setjmp(this->jerr.setjmp_buffer))
-	{
-		/* If we get here, the JPEG code has signaled an error. */
-		retval=-1;
-		goto bailout;
-	}
-
-	if(pitch==0) pitch=width*tjPixelSize[pixelFormat];
-
-	#ifndef JCS_EXTENSIONS
-	if(pixelFormat!=TJPF_GRAY)
-	{
-		rgbBuf=(unsigned char *)malloc(width*height*RGB_PIXELSIZE);
-		if(!rgbBuf) _throw("tjCompress2(): Memory allocation failure");
-		srcBuf=toRGB(srcBuf, width, pitch, height, pixelFormat, rgbBuf);
-		pitch=width*RGB_PIXELSIZE;
-	}
-	#endif
-
-	cinfo->image_width=width;
-	cinfo->image_height=height;
-
-	if(flags&TJFLAG_FORCEMMX) putenv("JSIMD_FORCEMMX=1");
-	else if(flags&TJFLAG_FORCESSE) putenv("JSIMD_FORCESSE=1");
-	else if(flags&TJFLAG_FORCESSE2) putenv("JSIMD_FORCESSE2=1");
-
-	if(flags&TJFLAG_NOREALLOC)
-	{
-		alloc=0;  *jpegSize=tjBufSize(width, height, jpegSubsamp);
-	}
-	jpeg_mem_dest_tj(cinfo, jpegBuf, jpegSize, alloc);
-	if(setCompDefaults(cinfo, pixelFormat, jpegSubsamp, jpegQual, flags)==-1)
-		return -1;
-
-	jpeg_start_compress(cinfo, TRUE);
-	if((row_pointer=(JSAMPROW *)malloc(sizeof(JSAMPROW)*height))==NULL)
-		_throw("tjCompress2(): Memory allocation failure");
-	for(i=0; i<height; i++)
-	{
-		if(flags&TJFLAG_BOTTOMUP) row_pointer[i]=&srcBuf[(height-i-1)*pitch];
-		else row_pointer[i]=&srcBuf[i*pitch];
-	}
-	while(cinfo->next_scanline<cinfo->image_height)
-	{
-		jpeg_write_scanlines(cinfo, &row_pointer[cinfo->next_scanline],
-			cinfo->image_height-cinfo->next_scanline);
-	}
-	jpeg_finish_compress(cinfo);
-
-	bailout:
-	if(cinfo->global_state>CSTATE_START) jpeg_abort_compress(cinfo);
-	#ifndef JCS_EXTENSIONS
-	if(rgbBuf) free(rgbBuf);
-	#endif
-	if(row_pointer) free(row_pointer);
-	return retval;
+  return tjBufSizeYUV(width, height, subsamp);
 }
 
-DLLEXPORT int DLLCALL tjCompress(tjhandle handle, unsigned char *srcBuf,
-	int width, int pitch, int height, int pixelSize, unsigned char *jpegBuf,
-	unsigned long *jpegSize, int jpegSubsamp, int jpegQual, int flags)
+
+/* TurboJPEG 1.4+ */
+DLLEXPORT int tjPlaneWidth(int componentID, int width, int subsamp)
 {
-	int retval=0;  unsigned long size;
-	if(flags&TJ_YUV)
-	{
-		size=tjBufSizeYUV(width, height, jpegSubsamp);
-		retval=tjEncodeYUV2(handle, srcBuf, width, pitch, height,
-			getPixelFormat(pixelSize, flags), jpegBuf, jpegSubsamp, flags);
-	}
-	else
-	{
-		retval=tjCompress2(handle, srcBuf, width, pitch, height,
-			getPixelFormat(pixelSize, flags), &jpegBuf, &size, jpegSubsamp, jpegQual,
-			flags|TJFLAG_NOREALLOC);
-	}
-	*jpegSize=size;
-	return retval;
+  unsigned long long pw, retval = 0;
+  int nc;
+
+  if (width < 1 || subsamp < 0 || subsamp >= TJ_NUMSAMP)
+    THROWG("tjPlaneWidth(): Invalid argument");
+  nc = (subsamp == TJSAMP_GRAY ? 1 : 3);
+  if (componentID < 0 || componentID >= nc)
+    THROWG("tjPlaneWidth(): Invalid argument");
+
+  pw = PAD((unsigned long long)width, tjMCUWidth[subsamp] / 8);
+  if (componentID == 0)
+    retval = pw;
+  else
+    retval = pw * 8 / tjMCUWidth[subsamp];
+
+  if (retval > (unsigned long long)INT_MAX)
+    THROWG("tjPlaneWidth(): Width is too large");
+
+bailout:
+  return (int)retval;
 }
 
 
-DLLEXPORT int DLLCALL tjEncodeYUV2(tjhandle handle, unsigned char *srcBuf,
-	int width, int pitch, int height, int pixelFormat, unsigned char *dstBuf,
-	int subsamp, int flags)
+/* TurboJPEG 1.4+ */
+DLLEXPORT int tjPlaneHeight(int componentID, int height, int subsamp)
 {
-	int i, retval=0;  JSAMPROW *row_pointer=NULL;
-	JSAMPLE *_tmpbuf[MAX_COMPONENTS], *_tmpbuf2[MAX_COMPONENTS];
-	JSAMPROW *tmpbuf[MAX_COMPONENTS], *tmpbuf2[MAX_COMPONENTS];
-	JSAMPROW *outbuf[MAX_COMPONENTS];
-	int row, pw, ph, cw[MAX_COMPONENTS], ch[MAX_COMPONENTS];
-	JSAMPLE *ptr=dstBuf;
-	unsigned long yuvsize=0;
-	jpeg_component_info *compptr;
-	#ifndef JCS_EXTENSIONS
-	unsigned char *rgbBuf=NULL;
-	#endif
+  unsigned long long ph, retval = 0;
+  int nc;
 
-	getinstance(handle);
+  if (height < 1 || subsamp < 0 || subsamp >= TJ_NUMSAMP)
+    THROWG("tjPlaneHeight(): Invalid argument");
+  nc = (subsamp == TJSAMP_GRAY ? 1 : 3);
+  if (componentID < 0 || componentID >= nc)
+    THROWG("tjPlaneHeight(): Invalid argument");
 
-	for(i=0; i<MAX_COMPONENTS; i++)
-	{
-		tmpbuf[i]=NULL;  _tmpbuf[i]=NULL;
-		tmpbuf2[i]=NULL;  _tmpbuf2[i]=NULL;  outbuf[i]=NULL;
-	}
+  ph = PAD((unsigned long long)height, tjMCUHeight[subsamp] / 8);
+  if (componentID == 0)
+    retval = ph;
+  else
+    retval = ph * 8 / tjMCUHeight[subsamp];
 
-	if((this->init&COMPRESS)==0)
-		_throw("tjEncodeYUV2(): Instance has not been initialized for compression");
+  if (retval > (unsigned long long)INT_MAX)
+    THROWG("tjPlaneHeight(): Height is too large");
 
-	if(srcBuf==NULL || width<=0 || pitch<0 || height<=0 || pixelFormat<0
-		|| pixelFormat>=TJ_NUMPF || dstBuf==NULL || subsamp<0
-		|| subsamp>=NUMSUBOPT)
-		_throw("tjEncodeYUV2(): Invalid argument");
-
-	if(setjmp(this->jerr.setjmp_buffer))
-	{
-		/* If we get here, the JPEG code has signaled an error. */
-		retval=-1;
-		goto bailout;
-	}
-
-	if(pitch==0) pitch=width*tjPixelSize[pixelFormat];
-
-	#ifndef JCS_EXTENSIONS
-	if(pixelFormat!=TJPF_GRAY)
-	{
-		rgbBuf=(unsigned char *)malloc(width*height*RGB_PIXELSIZE);
-		if(!rgbBuf) _throw("tjEncodeYUV2(): Memory allocation failure");
-		srcBuf=toRGB(srcBuf, width, pitch, height, pixelFormat, rgbBuf);
-		pitch=width*RGB_PIXELSIZE;
-	}
-	#endif
-
-	cinfo->image_width=width;
-	cinfo->image_height=height;
-
-	if(flags&TJFLAG_FORCEMMX) putenv("JSIMD_FORCEMMX=1");
-	else if(flags&TJFLAG_FORCESSE) putenv("JSIMD_FORCESSE=1");
-	else if(flags&TJFLAG_FORCESSE2) putenv("JSIMD_FORCESSE2=1");
-
-	yuvsize=tjBufSizeYUV(width, height, subsamp);
-	if(setCompDefaults(cinfo, pixelFormat, subsamp, -1, flags)==-1) return -1;
-
-	/* Execute only the parts of jpeg_start_compress() that we need.  If we
-	   were to call the whole jpeg_start_compress() function, then it would try
-	   to write the file headers, which could overflow the output buffer if the
-	   YUV image were very small. */
-	if(cinfo->global_state!=CSTATE_START)
-		_throw("tjEncodeYUV3(): libjpeg API is in the wrong state");
-	(*cinfo->err->reset_error_mgr)((j_common_ptr)cinfo);
-	jinit_c_master_control(cinfo, FALSE);
-	jinit_color_converter(cinfo);
-	jinit_downsampler(cinfo);
-	(*cinfo->cconvert->start_pass)(cinfo);
-
-	pw=PAD(width, cinfo->max_h_samp_factor);
-	ph=PAD(height, cinfo->max_v_samp_factor);
-
-	if((row_pointer=(JSAMPROW *)malloc(sizeof(JSAMPROW)*ph))==NULL)
-		_throw("tjEncodeYUV2(): Memory allocation failure");
-	for(i=0; i<height; i++)
-	{
-		if(flags&TJFLAG_BOTTOMUP) row_pointer[i]=&srcBuf[(height-i-1)*pitch];
-		else row_pointer[i]=&srcBuf[i*pitch];
-	}
-	if(height<ph)
-		for(i=height; i<ph; i++) row_pointer[i]=row_pointer[height-1];
-
-	for(i=0; i<cinfo->num_components; i++)
-	{
-		compptr=&cinfo->comp_info[i];
-		_tmpbuf[i]=(JSAMPLE *)malloc(
-			PAD((compptr->width_in_blocks*cinfo->max_h_samp_factor*DCTSIZE)
-				/compptr->h_samp_factor, 16) * cinfo->max_v_samp_factor + 16);
-		if(!_tmpbuf[i]) _throw("tjEncodeYUV2(): Memory allocation failure");
-		tmpbuf[i]=(JSAMPROW *)malloc(sizeof(JSAMPROW)*cinfo->max_v_samp_factor);
-		if(!tmpbuf[i]) _throw("tjEncodeYUV2(): Memory allocation failure");
-		for(row=0; row<cinfo->max_v_samp_factor; row++)
-		{
-			unsigned char *_tmpbuf_aligned=
-				(unsigned char *)PAD((size_t)_tmpbuf[i], 16);
-			tmpbuf[i][row]=&_tmpbuf_aligned[
-				PAD((compptr->width_in_blocks*cinfo->max_h_samp_factor*DCTSIZE)
-					/compptr->h_samp_factor, 16) * row];
-		}
-		_tmpbuf2[i]=(JSAMPLE *)malloc(PAD(compptr->width_in_blocks*DCTSIZE, 16)
-			* compptr->v_samp_factor + 16);
-		if(!_tmpbuf2[i]) _throw("tjEncodeYUV2(): Memory allocation failure");
-		tmpbuf2[i]=(JSAMPROW *)malloc(sizeof(JSAMPROW)*compptr->v_samp_factor);
-		if(!tmpbuf2[i]) _throw("tjEncodeYUV2(): Memory allocation failure");
-		for(row=0; row<compptr->v_samp_factor; row++)
-		{
-			unsigned char *_tmpbuf2_aligned=
-				(unsigned char *)PAD((size_t)_tmpbuf2[i], 16);
-			tmpbuf2[i][row]=&_tmpbuf2_aligned[
-				PAD(compptr->width_in_blocks*DCTSIZE, 16) * row];
-		}
-		cw[i]=pw*compptr->h_samp_factor/cinfo->max_h_samp_factor;
-		ch[i]=ph*compptr->v_samp_factor/cinfo->max_v_samp_factor;
-		outbuf[i]=(JSAMPROW *)malloc(sizeof(JSAMPROW)*ch[i]);
-		if(!outbuf[i]) _throw("tjEncodeYUV2(): Memory allocation failure");
-		for(row=0; row<ch[i]; row++)
-		{
-			outbuf[i][row]=ptr;
-			ptr+=PAD(cw[i], 4);
-		}
-	}
-	if(yuvsize!=(unsigned long)(ptr-dstBuf))
-		_throw("tjEncodeYUV2(): Generated image is not the correct size");
-
-	for(row=0; row<ph; row+=cinfo->max_v_samp_factor)
-	{
-		(*cinfo->cconvert->color_convert)(cinfo, &row_pointer[row], tmpbuf, 0,
-			cinfo->max_v_samp_factor);
-		(cinfo->downsample->downsample)(cinfo, tmpbuf, 0, tmpbuf2, 0);
-		for(i=0, compptr=cinfo->comp_info; i<cinfo->num_components; i++, compptr++)
-			jcopy_sample_rows(tmpbuf2[i], 0, outbuf[i],
-				row*compptr->v_samp_factor/cinfo->max_v_samp_factor,
-				compptr->v_samp_factor, cw[i]);
-	}
-	cinfo->next_scanline+=height;
-	jpeg_abort_compress(cinfo);
-
-	bailout:
-	if(cinfo->global_state>CSTATE_START) jpeg_abort_compress(cinfo);
-	#ifndef JCS_EXTENSIONS
-	if(rgbBuf) free(rgbBuf);
-	#endif
-	if(row_pointer) free(row_pointer);
-	for(i=0; i<MAX_COMPONENTS; i++)
-	{
-		if(tmpbuf[i]!=NULL) free(tmpbuf[i]);
-		if(_tmpbuf[i]!=NULL) free(_tmpbuf[i]);
-		if(tmpbuf2[i]!=NULL) free(tmpbuf2[i]);
-		if(_tmpbuf2[i]!=NULL) free(_tmpbuf2[i]);
-		if(outbuf[i]!=NULL) free(outbuf[i]);
-	}
-	return retval;
+bailout:
+  return (int)retval;
 }
 
-DLLEXPORT int DLLCALL tjEncodeYUV(tjhandle handle, unsigned char *srcBuf,
-	int width, int pitch, int height, int pixelSize, unsigned char *dstBuf,
-	int subsamp, int flags)
+
+/* TurboJPEG 1.4+ */
+DLLEXPORT unsigned long tjPlaneSizeYUV(int componentID, int width, int stride,
+                                       int height, int subsamp)
 {
-	return tjEncodeYUV2(handle, srcBuf, width, pitch, height,
-		getPixelFormat(pixelSize, flags), dstBuf, subsamp, flags);
+  unsigned long long retval = 0;
+  int pw, ph;
+
+  if (width < 1 || height < 1 || subsamp < 0 || subsamp >= TJ_NUMSAMP)
+    THROWG("tjPlaneSizeYUV(): Invalid argument");
+
+  pw = tjPlaneWidth(componentID, width, subsamp);
+  ph = tjPlaneHeight(componentID, height, subsamp);
+  if (pw < 0 || ph < 0) return -1;
+
+  if (stride == 0) stride = pw;
+  else stride = abs(stride);
+
+  retval = (unsigned long long)stride * (ph - 1) + pw;
+#if ULLONG_MAX > ULONG_MAX
+  if (retval > (unsigned long long)((unsigned long)-1))
+    THROWG("tjPlaneSizeYUV(): Image is too large");
+#endif
+
+bailout:
+  return (unsigned long)retval;
 }
 
 
-/* Decompressor */
+/* TurboJPEG 1.2+ */
+DLLEXPORT int tjCompress2(tjhandle handle, const unsigned char *srcBuf,
+                          int width, int pitch, int height, int pixelFormat,
+                          unsigned char **jpegBuf, unsigned long *jpegSize,
+                          int jpegSubsamp, int jpegQual, int flags)
+{
+  int i, retval = 0;
+  boolean alloc = TRUE;
+  JSAMPROW *row_pointer = NULL;
+#ifndef JCS_EXTENSIONS
+  unsigned char *rgbBuf = NULL;
+#endif
+
+  GET_CINSTANCE(handle)
+  this->jerr.stopOnWarning = (flags & TJFLAG_STOPONWARNING) ? TRUE : FALSE;
+  if ((this->init & COMPRESS) == 0)
+    THROW("tjCompress2(): Instance has not been initialized for compression");
+
+  if (srcBuf == NULL || width <= 0 || pitch < 0 || height <= 0 ||
+      pixelFormat < 0 || pixelFormat >= TJ_NUMPF || jpegBuf == NULL ||
+      jpegSize == NULL || jpegSubsamp < 0 || jpegSubsamp >= TJ_NUMSAMP ||
+      jpegQual < 0 || jpegQual > 100)
+    THROW("tjCompress2(): Invalid argument");
+
+  if (pitch == 0) pitch = width * tjPixelSize[pixelFormat];
+
+  if ((row_pointer = (JSAMPROW *)malloc(sizeof(JSAMPROW) * height)) == NULL)
+    THROW("tjCompress2(): Memory allocation failure");
+
+  if (setjmp(this->jerr.setjmp_buffer)) {
+    /* If we get here, the JPEG code has signaled an error. */
+    retval = -1;  goto bailout;
+  }
+
+  cinfo->image_width = width;
+  cinfo->image_height = height;
+
+#ifndef NO_PUTENV
+  if (flags & TJFLAG_FORCEMMX) PUTENV_S("JSIMD_FORCEMMX", "1");
+  else if (flags & TJFLAG_FORCESSE) PUTENV_S("JSIMD_FORCESSE", "1");
+  else if (flags & TJFLAG_FORCESSE2) PUTENV_S("JSIMD_FORCESSE2", "1");
+#endif
+
+  if (flags & TJFLAG_NOREALLOC) {
+    alloc = FALSE;  *jpegSize = tjBufSize(width, height, jpegSubsamp);
+  }
+  jpeg_mem_dest_tj(cinfo, jpegBuf, jpegSize, alloc);
+  setCompDefaults(cinfo, pixelFormat, jpegSubsamp, jpegQual, flags);
+
+#ifndef JCS_EXTENSIONS
+  if (pixelFormat != TJPF_GRAY && pixelFormat != TJPF_CMYK &&
+      (tjRedOffset[pixelFormat] != RGB_RED ||
+       tjGreenOffset[pixelFormat] != RGB_GREEN ||
+       tjBlueOffset[pixelFormat] != RGB_BLUE ||
+       tjPixelSize[pixelFormat] != RGB_PIXELSIZE)) {
+    rgbBuf = (unsigned char *)malloc(width * height * RGB_PIXELSIZE);
+    if (!rgbBuf) THROW("tjCompress2(): Memory allocation failure");
+    srcBuf = toRGB((unsigned char *)srcBuf, width, pitch, height, pixelFormat,
+                   rgbBuf, RGB_RED, RGB_GREEN, RGB_BLUE, RGB_PIXELSIZE);
+    pitch = width * RGB_PIXELSIZE;
+    cinfo->in_color_space = JCS_RGB;
+    cinfo->input_components = RGB_PIXELSIZE;
+  }
+#endif
+
+  jpeg_start_compress(cinfo, TRUE);
+  for (i = 0; i < height; i++) {
+    if (flags & TJFLAG_BOTTOMUP)
+      row_pointer[i] = (JSAMPROW)&srcBuf[(height - i - 1) * (size_t)pitch];
+    else
+      row_pointer[i] = (JSAMPROW)&srcBuf[i * (size_t)pitch];
+  }
+  while (cinfo->next_scanline < cinfo->image_height)
+    jpeg_write_scanlines(cinfo, &row_pointer[cinfo->next_scanline],
+                         cinfo->image_height - cinfo->next_scanline);
+  jpeg_finish_compress(cinfo);
+
+bailout:
+  if (cinfo->global_state > CSTATE_START && alloc)
+    (*cinfo->dest->term_destination) (cinfo);
+  if (cinfo->global_state > CSTATE_START || retval == -1)
+    jpeg_abort_compress(cinfo);
+#ifndef JCS_EXTENSIONS
+  free(rgbBuf);
+#endif
+  free(row_pointer);
+  if (this->jerr.warning) retval = -1;
+  this->jerr.stopOnWarning = FALSE;
+  return retval;
+}
+
+/* TurboJPEG 1.0+ */
+DLLEXPORT int tjCompress(tjhandle handle, unsigned char *srcBuf, int width,
+                         int pitch, int height, int pixelSize,
+                         unsigned char *jpegBuf, unsigned long *jpegSize,
+                         int jpegSubsamp, int jpegQual, int flags)
+{
+  int retval = 0;
+  unsigned long size;
+
+  if (flags & TJ_YUV) {
+    size = tjBufSizeYUV(width, height, jpegSubsamp);
+    retval = tjEncodeYUV2(handle, srcBuf, width, pitch, height,
+                          getPixelFormat(pixelSize, flags), jpegBuf,
+                          jpegSubsamp, flags);
+  } else {
+    retval = tjCompress2(handle, srcBuf, width, pitch, height,
+                         getPixelFormat(pixelSize, flags), &jpegBuf, &size,
+                         jpegSubsamp, jpegQual, flags | TJFLAG_NOREALLOC);
+  }
+  *jpegSize = size;
+  return retval;
+}
+
+
+/* TurboJPEG 1.4+ */
+DLLEXPORT int tjEncodeYUVPlanes(tjhandle handle, const unsigned char *srcBuf,
+                                int width, int pitch, int height,
+                                int pixelFormat, unsigned char **dstPlanes,
+                                int *strides, int subsamp, int flags)
+{
+  JSAMPROW *row_pointer = NULL;
+  JSAMPLE *_tmpbuf[MAX_COMPONENTS], *_tmpbuf2[MAX_COMPONENTS];
+  JSAMPROW *tmpbuf[MAX_COMPONENTS], *tmpbuf2[MAX_COMPONENTS];
+  JSAMPROW *outbuf[MAX_COMPONENTS];
+  int i, retval = 0, row, pw0, ph0, pw[MAX_COMPONENTS], ph[MAX_COMPONENTS];
+  JSAMPLE *ptr;
+  jpeg_component_info *compptr;
+#ifndef JCS_EXTENSIONS
+  unsigned char *rgbBuf = NULL;
+#endif
+
+  GET_CINSTANCE(handle);
+  this->jerr.stopOnWarning = (flags & TJFLAG_STOPONWARNING) ? TRUE : FALSE;
+
+  for (i = 0; i < MAX_COMPONENTS; i++) {
+    tmpbuf[i] = NULL;  _tmpbuf[i] = NULL;
+    tmpbuf2[i] = NULL;  _tmpbuf2[i] = NULL;  outbuf[i] = NULL;
+  }
+
+  if ((this->init & COMPRESS) == 0)
+    THROW("tjEncodeYUVPlanes(): Instance has not been initialized for compression");
+
+  if (srcBuf == NULL || width <= 0 || pitch < 0 || height <= 0 ||
+      pixelFormat < 0 || pixelFormat >= TJ_NUMPF || !dstPlanes ||
+      !dstPlanes[0] || subsamp < 0 || subsamp >= TJ_NUMSAMP)
+    THROW("tjEncodeYUVPlanes(): Invalid argument");
+  if (subsamp != TJSAMP_GRAY && (!dstPlanes[1] || !dstPlanes[2]))
+    THROW("tjEncodeYUVPlanes(): Invalid argument");
+
+  if (pixelFormat == TJPF_CMYK)
+    THROW("tjEncodeYUVPlanes(): Cannot generate YUV images from packed-pixel CMYK images");
+
+  if (pitch == 0) pitch = width * tjPixelSize[pixelFormat];
+
+  if (setjmp(this->jerr.setjmp_buffer)) {
+    /* If we get here, the JPEG code has signaled an error. */
+    retval = -1;  goto bailout;
+  }
+
+  cinfo->image_width = width;
+  cinfo->image_height = height;
+
+#ifndef NO_PUTENV
+  if (flags & TJFLAG_FORCEMMX) PUTENV_S("JSIMD_FORCEMMX", "1");
+  else if (flags & TJFLAG_FORCESSE) PUTENV_S("JSIMD_FORCESSE", "1");
+  else if (flags & TJFLAG_FORCESSE2) PUTENV_S("JSIMD_FORCESSE2", "1");
+#endif
+
+  setCompDefaults(cinfo, pixelFormat, subsamp, -1, flags);
+
+#ifndef JCS_EXTENSIONS
+  if (pixelFormat != TJPF_GRAY &&
+      (tjRedOffset[pixelFormat] != RGB_RED ||
+       tjGreenOffset[pixelFormat] != RGB_GREEN ||
+       tjBlueOffset[pixelFormat] != RGB_BLUE ||
+       tjPixelSize[pixelFormat] != RGB_PIXELSIZE)) {
+    rgbBuf = (unsigned char *)malloc(width * height * RGB_PIXELSIZE);
+    if (!rgbBuf) THROW("tjEncodeYUVPlanes(): Memory allocation failure");
+    srcBuf = toRGB((unsigned char *)srcBuf, width, pitch, height, pixelFormat,
+                   rgbBuf, RGB_RED, RGB_GREEN, RGB_BLUE, RGB_PIXELSIZE);
+    pitch = width * RGB_PIXELSIZE;
+    cinfo->in_color_space = JCS_RGB;
+    cinfo->input_components = RGB_PIXELSIZE;
+  }
+#endif
+
+  /* Execute only the parts of jpeg_start_compress() that we need.  If we
+     were to call the whole jpeg_start_compress() function, then it would try
+     to write the file headers, which could overflow the output buffer if the
+     YUV image were very small. */
+  if (cinfo->global_state != CSTATE_START)
+    THROW("tjEncodeYUVPlanes(): libjpeg API is in the wrong state");
+  (*cinfo->err->reset_error_mgr) ((j_common_ptr)cinfo);
+  jinit_c_master_control(cinfo, FALSE);
+  jinit_color_converter(cinfo);
+  jinit_downsampler(cinfo);
+  (*cinfo->cconvert->start_pass) (cinfo);
+
+  pw0 = PAD(width, cinfo->max_h_samp_factor);
+  ph0 = PAD(height, cinfo->max_v_samp_factor);
+
+  if ((row_pointer = (JSAMPROW *)malloc(sizeof(JSAMPROW) * ph0)) == NULL)
+    THROW("tjEncodeYUVPlanes(): Memory allocation failure");
+  for (i = 0; i < height; i++) {
+    if (flags & TJFLAG_BOTTOMUP)
+      row_pointer[i] = (JSAMPROW)&srcBuf[(height - i - 1) * (size_t)pitch];
+    else
+      row_pointer[i] = (JSAMPROW)&srcBuf[i * (size_t)pitch];
+  }
+  if (height < ph0)
+    for (i = height; i < ph0; i++) row_pointer[i] = row_pointer[height - 1];
+
+  for (i = 0; i < cinfo->num_components; i++) {
+    compptr = &cinfo->comp_info[i];
+    _tmpbuf[i] = (JSAMPLE *)MALLOC(
+      PAD((compptr->width_in_blocks * cinfo->max_h_samp_factor * DCTSIZE) /
+          compptr->h_samp_factor, 32) *
+      cinfo->max_v_samp_factor + 32);
+    if (!_tmpbuf[i])
+      THROW("tjEncodeYUVPlanes(): Memory allocation failure");
+    tmpbuf[i] =
+      (JSAMPROW *)malloc(sizeof(JSAMPROW) * cinfo->max_v_samp_factor);
+    if (!tmpbuf[i])
+      THROW("tjEncodeYUVPlanes(): Memory allocation failure");
+    for (row = 0; row < cinfo->max_v_samp_factor; row++) {
+      unsigned char *_tmpbuf_aligned =
+        (unsigned char *)PAD((JUINTPTR)_tmpbuf[i], 32);
+
+      tmpbuf[i][row] = &_tmpbuf_aligned[
+        PAD((compptr->width_in_blocks * cinfo->max_h_samp_factor * DCTSIZE) /
+            compptr->h_samp_factor, 32) * row];
+    }
+    _tmpbuf2[i] =
+      (JSAMPLE *)MALLOC(PAD(compptr->width_in_blocks * DCTSIZE, 32) *
+                        compptr->v_samp_factor + 32);
+    if (!_tmpbuf2[i])
+      THROW("tjEncodeYUVPlanes(): Memory allocation failure");
+    tmpbuf2[i] = (JSAMPROW *)malloc(sizeof(JSAMPROW) * compptr->v_samp_factor);
+    if (!tmpbuf2[i])
+      THROW("tjEncodeYUVPlanes(): Memory allocation failure");
+    for (row = 0; row < compptr->v_samp_factor; row++) {
+      unsigned char *_tmpbuf2_aligned =
+        (unsigned char *)PAD((JUINTPTR)_tmpbuf2[i], 32);
+
+      tmpbuf2[i][row] =
+        &_tmpbuf2_aligned[PAD(compptr->width_in_blocks * DCTSIZE, 32) * row];
+    }
+    pw[i] = pw0 * compptr->h_samp_factor / cinfo->max_h_samp_factor;
+    ph[i] = ph0 * compptr->v_samp_factor / cinfo->max_v_samp_factor;
+    outbuf[i] = (JSAMPROW *)malloc(sizeof(JSAMPROW) * ph[i]);
+    if (!outbuf[i])
+      THROW("tjEncodeYUVPlanes(): Memory allocation failure");
+    ptr = dstPlanes[i];
+    for (row = 0; row < ph[i]; row++) {
+      outbuf[i][row] = ptr;
+      ptr += (strides && strides[i] != 0) ? strides[i] : pw[i];
+    }
+  }
+
+  if (setjmp(this->jerr.setjmp_buffer)) {
+    /* If we get here, the JPEG code has signaled an error. */
+    retval = -1;  goto bailout;
+  }
+
+  for (row = 0; row < ph0; row += cinfo->max_v_samp_factor) {
+    (*cinfo->cconvert->color_convert) (cinfo, &row_pointer[row], tmpbuf, 0,
+                                       cinfo->max_v_samp_factor);
+    (cinfo->downsample->downsample) (cinfo, tmpbuf, 0, tmpbuf2, 0);
+    for (i = 0, compptr = cinfo->comp_info; i < cinfo->num_components;
+         i++, compptr++)
+      jcopy_sample_rows(tmpbuf2[i], 0, outbuf[i],
+        row * compptr->v_samp_factor / cinfo->max_v_samp_factor,
+        compptr->v_samp_factor, pw[i]);
+  }
+  cinfo->next_scanline += height;
+  jpeg_abort_compress(cinfo);
+
+bailout:
+  if (cinfo->global_state > CSTATE_START) jpeg_abort_compress(cinfo);
+#ifndef JCS_EXTENSIONS
+  free(rgbBuf);
+#endif
+  free(row_pointer);
+  for (i = 0; i < MAX_COMPONENTS; i++) {
+    free(tmpbuf[i]);
+    free(_tmpbuf[i]);
+    free(tmpbuf2[i]);
+    free(_tmpbuf2[i]);
+    free(outbuf[i]);
+  }
+  if (this->jerr.warning) retval = -1;
+  this->jerr.stopOnWarning = FALSE;
+  return retval;
+}
+
+/* TurboJPEG 1.4+ */
+DLLEXPORT int tjEncodeYUV3(tjhandle handle, const unsigned char *srcBuf,
+                           int width, int pitch, int height, int pixelFormat,
+                           unsigned char *dstBuf, int align, int subsamp,
+                           int flags)
+{
+  unsigned char *dstPlanes[3];
+  int pw0, ph0, strides[3], retval = -1;
+  tjinstance *this = (tjinstance *)handle;
+
+  if (!this) THROWG("tjEncodeYUV3(): Invalid handle");
+  this->isInstanceError = FALSE;
+
+  if (width <= 0 || height <= 0 || dstBuf == NULL || align < 1 ||
+      !IS_POW2(align) || subsamp < 0 || subsamp >= TJ_NUMSAMP)
+    THROW("tjEncodeYUV3(): Invalid argument");
+
+  pw0 = tjPlaneWidth(0, width, subsamp);
+  ph0 = tjPlaneHeight(0, height, subsamp);
+  dstPlanes[0] = dstBuf;
+  strides[0] = PAD(pw0, align);
+  if (subsamp == TJSAMP_GRAY) {
+    strides[1] = strides[2] = 0;
+    dstPlanes[1] = dstPlanes[2] = NULL;
+  } else {
+    int pw1 = tjPlaneWidth(1, width, subsamp);
+    int ph1 = tjPlaneHeight(1, height, subsamp);
+
+    strides[1] = strides[2] = PAD(pw1, align);
+    if ((unsigned long long)strides[0] * (unsigned long long)ph0 >
+        (unsigned long long)INT_MAX ||
+        (unsigned long long)strides[1] * (unsigned long long)ph1 >
+        (unsigned long long)INT_MAX)
+      THROW("Image or row alignment is too large");
+    dstPlanes[1] = dstPlanes[0] + strides[0] * ph0;
+    dstPlanes[2] = dstPlanes[1] + strides[1] * ph1;
+  }
+
+  return tjEncodeYUVPlanes(handle, srcBuf, width, pitch, height, pixelFormat,
+                           dstPlanes, strides, subsamp, flags);
+
+bailout:
+  return retval;
+}
+
+/* TurboJPEG 1.2+ */
+DLLEXPORT int tjEncodeYUV2(tjhandle handle, unsigned char *srcBuf, int width,
+                           int pitch, int height, int pixelFormat,
+                           unsigned char *dstBuf, int subsamp, int flags)
+{
+  return tjEncodeYUV3(handle, srcBuf, width, pitch, height, pixelFormat,
+                      dstBuf, 4, subsamp, flags);
+}
+
+/* TurboJPEG 1.1+ */
+DLLEXPORT int tjEncodeYUV(tjhandle handle, unsigned char *srcBuf, int width,
+                          int pitch, int height, int pixelSize,
+                          unsigned char *dstBuf, int subsamp, int flags)
+{
+  return tjEncodeYUV2(handle, srcBuf, width, pitch, height,
+                      getPixelFormat(pixelSize, flags), dstBuf, subsamp,
+                      flags);
+}
+
+
+/* TurboJPEG 1.4+ */
+DLLEXPORT int tjCompressFromYUVPlanes(tjhandle handle,
+                                      const unsigned char **srcPlanes,
+                                      int width, const int *strides,
+                                      int height, int subsamp,
+                                      unsigned char **jpegBuf,
+                                      unsigned long *jpegSize, int jpegQual,
+                                      int flags)
+{
+  int i, row, retval = 0;
+  boolean alloc = TRUE;
+  int pw[MAX_COMPONENTS], ph[MAX_COMPONENTS], iw[MAX_COMPONENTS],
+    tmpbufsize = 0, usetmpbuf = 0, th[MAX_COMPONENTS];
+  JSAMPLE *_tmpbuf = NULL, *ptr;
+  JSAMPROW *inbuf[MAX_COMPONENTS], *tmpbuf[MAX_COMPONENTS];
+
+  GET_CINSTANCE(handle)
+  this->jerr.stopOnWarning = (flags & TJFLAG_STOPONWARNING) ? TRUE : FALSE;
+
+  for (i = 0; i < MAX_COMPONENTS; i++) {
+    tmpbuf[i] = NULL;  inbuf[i] = NULL;
+  }
+
+  if ((this->init & COMPRESS) == 0)
+    THROW("tjCompressFromYUVPlanes(): Instance has not been initialized for compression");
+
+  if (!srcPlanes || !srcPlanes[0] || width <= 0 || height <= 0 ||
+      subsamp < 0 || subsamp >= TJ_NUMSAMP || jpegBuf == NULL ||
+      jpegSize == NULL || jpegQual < 0 || jpegQual > 100)
+    THROW("tjCompressFromYUVPlanes(): Invalid argument");
+  if (subsamp != TJSAMP_GRAY && (!srcPlanes[1] || !srcPlanes[2]))
+    THROW("tjCompressFromYUVPlanes(): Invalid argument");
+
+  if (setjmp(this->jerr.setjmp_buffer)) {
+    /* If we get here, the JPEG code has signaled an error. */
+    retval = -1;  goto bailout;
+  }
+
+  cinfo->image_width = width;
+  cinfo->image_height = height;
+
+#ifndef NO_PUTENV
+  if (flags & TJFLAG_FORCEMMX) PUTENV_S("JSIMD_FORCEMMX", "1");
+  else if (flags & TJFLAG_FORCESSE) PUTENV_S("JSIMD_FORCESSE", "1");
+  else if (flags & TJFLAG_FORCESSE2) PUTENV_S("JSIMD_FORCESSE2", "1");
+#endif
+
+  if (flags & TJFLAG_NOREALLOC) {
+    alloc = FALSE;  *jpegSize = tjBufSize(width, height, subsamp);
+  }
+  jpeg_mem_dest_tj(cinfo, jpegBuf, jpegSize, alloc);
+  setCompDefaults(cinfo, TJPF_RGB, subsamp, jpegQual, flags);
+  cinfo->raw_data_in = TRUE;
+
+  jpeg_start_compress(cinfo, TRUE);
+  for (i = 0; i < cinfo->num_components; i++) {
+    jpeg_component_info *compptr = &cinfo->comp_info[i];
+    int ih;
+
+    iw[i] = compptr->width_in_blocks * DCTSIZE;
+    ih = compptr->height_in_blocks * DCTSIZE;
+    pw[i] = PAD(cinfo->image_width, cinfo->max_h_samp_factor) *
+            compptr->h_samp_factor / cinfo->max_h_samp_factor;
+    ph[i] = PAD(cinfo->image_height, cinfo->max_v_samp_factor) *
+            compptr->v_samp_factor / cinfo->max_v_samp_factor;
+    if (iw[i] != pw[i] || ih != ph[i]) usetmpbuf = 1;
+    th[i] = compptr->v_samp_factor * DCTSIZE;
+    tmpbufsize += iw[i] * th[i];
+    if ((inbuf[i] = (JSAMPROW *)malloc(sizeof(JSAMPROW) * ph[i])) == NULL)
+      THROW("tjCompressFromYUVPlanes(): Memory allocation failure");
+    ptr = (JSAMPLE *)srcPlanes[i];
+    for (row = 0; row < ph[i]; row++) {
+      inbuf[i][row] = ptr;
+      ptr += (strides && strides[i] != 0) ? strides[i] : pw[i];
+    }
+  }
+  if (usetmpbuf) {
+    if ((_tmpbuf = (JSAMPLE *)malloc(sizeof(JSAMPLE) * tmpbufsize)) == NULL)
+      THROW("tjCompressFromYUVPlanes(): Memory allocation failure");
+    ptr = _tmpbuf;
+    for (i = 0; i < cinfo->num_components; i++) {
+      if ((tmpbuf[i] = (JSAMPROW *)malloc(sizeof(JSAMPROW) * th[i])) == NULL)
+        THROW("tjCompressFromYUVPlanes(): Memory allocation failure");
+      for (row = 0; row < th[i]; row++) {
+        tmpbuf[i][row] = ptr;
+        ptr += iw[i];
+      }
+    }
+  }
+
+  if (setjmp(this->jerr.setjmp_buffer)) {
+    /* If we get here, the JPEG code has signaled an error. */
+    retval = -1;  goto bailout;
+  }
+
+  for (row = 0; row < (int)cinfo->image_height;
+       row += cinfo->max_v_samp_factor * DCTSIZE) {
+    JSAMPARRAY yuvptr[MAX_COMPONENTS];
+    int crow[MAX_COMPONENTS];
+
+    for (i = 0; i < cinfo->num_components; i++) {
+      jpeg_component_info *compptr = &cinfo->comp_info[i];
+
+      crow[i] = row * compptr->v_samp_factor / cinfo->max_v_samp_factor;
+      if (usetmpbuf) {
+        int j, k;
+
+        for (j = 0; j < MIN(th[i], ph[i] - crow[i]); j++) {
+          memcpy(tmpbuf[i][j], inbuf[i][crow[i] + j], pw[i]);
+          /* Duplicate last sample in row to fill out MCU */
+          for (k = pw[i]; k < iw[i]; k++)
+            tmpbuf[i][j][k] = tmpbuf[i][j][pw[i] - 1];
+        }
+        /* Duplicate last row to fill out MCU */
+        for (j = ph[i] - crow[i]; j < th[i]; j++)
+          memcpy(tmpbuf[i][j], tmpbuf[i][ph[i] - crow[i] - 1], iw[i]);
+        yuvptr[i] = tmpbuf[i];
+      } else
+        yuvptr[i] = &inbuf[i][crow[i]];
+    }
+    jpeg_write_raw_data(cinfo, yuvptr, cinfo->max_v_samp_factor * DCTSIZE);
+  }
+  jpeg_finish_compress(cinfo);
+
+bailout:
+  if (cinfo->global_state > CSTATE_START && alloc)
+    (*cinfo->dest->term_destination) (cinfo);
+  if (cinfo->global_state > CSTATE_START || retval == -1)
+    jpeg_abort_compress(cinfo);
+  for (i = 0; i < MAX_COMPONENTS; i++) {
+    free(tmpbuf[i]);
+    free(inbuf[i]);
+  }
+  free(_tmpbuf);
+  if (this->jerr.warning) retval = -1;
+  this->jerr.stopOnWarning = FALSE;
+  return retval;
+}
+
+/* TurboJPEG 1.4+ */
+DLLEXPORT int tjCompressFromYUV(tjhandle handle, const unsigned char *srcBuf,
+                                int width, int align, int height, int subsamp,
+                                unsigned char **jpegBuf,
+                                unsigned long *jpegSize, int jpegQual,
+                                int flags)
+{
+  const unsigned char *srcPlanes[3];
+  int pw0, ph0, strides[3], retval = -1;
+  tjinstance *this = (tjinstance *)handle;
+
+  if (!this) THROWG("tjCompressFromYUV(): Invalid handle");
+  this->isInstanceError = FALSE;
+
+  if (srcBuf == NULL || width <= 0 || align < 1 || !IS_POW2(align) ||
+      height <= 0 || subsamp < 0 || subsamp >= TJ_NUMSAMP)
+    THROW("tjCompressFromYUV(): Invalid argument");
+
+  pw0 = tjPlaneWidth(0, width, subsamp);
+  ph0 = tjPlaneHeight(0, height, subsamp);
+  srcPlanes[0] = srcBuf;
+  strides[0] = PAD(pw0, align);
+  if (subsamp == TJSAMP_GRAY) {
+    strides[1] = strides[2] = 0;
+    srcPlanes[1] = srcPlanes[2] = NULL;
+  } else {
+    int pw1 = tjPlaneWidth(1, width, subsamp);
+    int ph1 = tjPlaneHeight(1, height, subsamp);
+
+    strides[1] = strides[2] = PAD(pw1, align);
+    if ((unsigned long long)strides[0] * (unsigned long long)ph0 >
+        (unsigned long long)INT_MAX ||
+        (unsigned long long)strides[1] * (unsigned long long)ph1 >
+        (unsigned long long)INT_MAX)
+      THROW("Image or row alignment is too large");
+    srcPlanes[1] = srcPlanes[0] + strides[0] * ph0;
+    srcPlanes[2] = srcPlanes[1] + strides[1] * ph1;
+  }
+
+  return tjCompressFromYUVPlanes(handle, srcPlanes, width, strides, height,
+                                 subsamp, jpegBuf, jpegSize, jpegQual, flags);
+
+bailout:
+  return retval;
+}
+
+
+/******************************* Decompressor ********************************/
 
 static tjhandle _tjInitDecompress(tjinstance *this)
 {
-	unsigned char buffer[1];
+  static unsigned char buffer[1];
 
-	/* This is also straight out of example.c */
-	this->dinfo.err=jpeg_std_error(&this->jerr.pub);
-	this->jerr.pub.error_exit=my_error_exit;
-	this->jerr.pub.output_message=my_output_message;
+  /* This is also straight out of example.txt */
+  this->dinfo.err = jpeg_std_error(&this->jerr.pub);
+  this->jerr.pub.error_exit = my_error_exit;
+  this->jerr.pub.output_message = my_output_message;
+  this->jerr.emit_message = this->jerr.pub.emit_message;
+  this->jerr.pub.emit_message = my_emit_message;
+  this->jerr.pub.addon_message_table = turbojpeg_message_table;
+  this->jerr.pub.first_addon_message = JMSG_FIRSTADDONCODE;
+  this->jerr.pub.last_addon_message = JMSG_LASTADDONCODE;
 
-	if(setjmp(this->jerr.setjmp_buffer))
-	{
-		/* If we get here, the JPEG code has signaled an error. */
-		if(this) free(this);  return NULL;
-	}
+  if (setjmp(this->jerr.setjmp_buffer)) {
+    /* If we get here, the JPEG code has signaled an error. */
+    free(this);
+    return NULL;
+  }
 
-	jpeg_create_decompress(&this->dinfo);
-	/* Make an initial call so it will create the source manager */
-	jpeg_mem_src_tj(&this->dinfo, buffer, 1);
+  jpeg_create_decompress(&this->dinfo);
+  /* Make an initial call so it will create the source manager */
+  jpeg_mem_src_tj(&this->dinfo, buffer, 1);
 
-	this->init|=DECOMPRESS;
-	return (tjhandle)this;
+  this->init |= DECOMPRESS;
+  return (tjhandle)this;
 }
 
-DLLEXPORT tjhandle DLLCALL tjInitDecompress(void)
+/* TurboJPEG 1.0+ */
+DLLEXPORT tjhandle tjInitDecompress(void)
 {
-	tjinstance *this;
-	if((this=(tjinstance *)malloc(sizeof(tjinstance)))==NULL)
-	{
-		snprintf(errStr, JMSG_LENGTH_MAX,
-			"tjInitDecompress(): Memory allocation failure");
-		return NULL;
-	}
-	MEMZERO(this, sizeof(tjinstance));
-	return _tjInitDecompress(this);
-}
+  tjinstance *this;
 
-
-DLLEXPORT int DLLCALL tjDecompressHeader2(tjhandle handle,
-	unsigned char *jpegBuf, unsigned long jpegSize, int *width, int *height,
-	int *jpegSubsamp)
-{
-	int retval=0;
-
-	getinstance(handle);
-	if((this->init&DECOMPRESS)==0)
-		_throw("tjDecompressHeader2(): Instance has not been initialized for decompression");
-
-	if(jpegBuf==NULL || jpegSize<=0 || width==NULL || height==NULL
-		|| jpegSubsamp==NULL)
-		_throw("tjDecompressHeader2(): Invalid argument");
-
-	if(setjmp(this->jerr.setjmp_buffer))
-	{
-		/* If we get here, the JPEG code has signaled an error. */
-		return -1;
-	}
-
-	jpeg_mem_src_tj(dinfo, jpegBuf, jpegSize);
-	jpeg_read_header(dinfo, TRUE);
-
-	*width=dinfo->image_width;
-	*height=dinfo->image_height;
-	*jpegSubsamp=getSubsamp(dinfo);
-
-	jpeg_abort_decompress(dinfo);
-
-	if(*jpegSubsamp<0)
-		_throw("tjDecompressHeader2(): Could not determine subsampling type for JPEG image");
-	if(*width<1 || *height<1)
-		_throw("tjDecompressHeader2(): Invalid data returned in header");
-
-	bailout:
-	return retval;
-}
-
-DLLEXPORT int DLLCALL tjDecompressHeader(tjhandle handle,
-	unsigned char *jpegBuf, unsigned long jpegSize, int *width, int *height)
-{
-	int jpegSubsamp;
-	return tjDecompressHeader2(handle, jpegBuf, jpegSize, width, height,
-		&jpegSubsamp);
+  if ((this = (tjinstance *)malloc(sizeof(tjinstance))) == NULL) {
+    SNPRINTF(errStr, JMSG_LENGTH_MAX,
+             "tjInitDecompress(): Memory allocation failure");
+    return NULL;
+  }
+  memset(this, 0, sizeof(tjinstance));
+  SNPRINTF(this->errStr, JMSG_LENGTH_MAX, "No error");
+  return _tjInitDecompress(this);
 }
 
 
-DLLEXPORT tjscalingfactor* DLLCALL tjGetScalingFactors(int *numscalingfactors)
+/* TurboJPEG 1.4+ */
+DLLEXPORT int tjDecompressHeader3(tjhandle handle,
+                                  const unsigned char *jpegBuf,
+                                  unsigned long jpegSize, int *width,
+                                  int *height, int *jpegSubsamp,
+                                  int *jpegColorspace)
 {
-	if(numscalingfactors==NULL)
-	{
-		snprintf(errStr, JMSG_LENGTH_MAX,
-			"tjGetScalingFactors(): Invalid argument");
-		return NULL;
-	}
+  int retval = 0;
 
-	*numscalingfactors=NUMSF;
-	return (tjscalingfactor *)sf;
+  GET_DINSTANCE(handle);
+  if ((this->init & DECOMPRESS) == 0)
+    THROW("tjDecompressHeader3(): Instance has not been initialized for decompression");
+
+  if (jpegBuf == NULL || jpegSize <= 0 || width == NULL || height == NULL ||
+      jpegSubsamp == NULL || jpegColorspace == NULL)
+    THROW("tjDecompressHeader3(): Invalid argument");
+
+  if (setjmp(this->jerr.setjmp_buffer)) {
+    /* If we get here, the JPEG code has signaled an error. */
+    return -1;
+  }
+
+  jpeg_mem_src_tj(dinfo, jpegBuf, jpegSize);
+
+  /* jpeg_read_header() calls jpeg_abort() and returns JPEG_HEADER_TABLES_ONLY
+     if the datastream is a tables-only datastream.  Since we aren't using a
+     suspending data source, the only other value it can return is
+     JPEG_HEADER_OK. */
+  if (jpeg_read_header(dinfo, FALSE) == JPEG_HEADER_TABLES_ONLY)
+    return 0;
+
+  *width = dinfo->image_width;
+  *height = dinfo->image_height;
+  *jpegSubsamp = getSubsamp(dinfo);
+  switch (dinfo->jpeg_color_space) {
+  case JCS_GRAYSCALE:  *jpegColorspace = TJCS_GRAY;  break;
+  case JCS_RGB:        *jpegColorspace = TJCS_RGB;  break;
+  case JCS_YCbCr:      *jpegColorspace = TJCS_YCbCr;  break;
+  case JCS_CMYK:       *jpegColorspace = TJCS_CMYK;  break;
+  case JCS_YCCK:       *jpegColorspace = TJCS_YCCK;  break;
+  default:             *jpegColorspace = -1;  break;
+  }
+
+  jpeg_abort_decompress(dinfo);
+
+  if (*jpegSubsamp < 0)
+    THROW("tjDecompressHeader3(): Could not determine subsampling type for JPEG image");
+  if (*jpegColorspace < 0)
+    THROW("tjDecompressHeader3(): Could not determine colorspace of JPEG image");
+  if (*width < 1 || *height < 1)
+    THROW("tjDecompressHeader3(): Invalid data returned in header");
+
+bailout:
+  if (this->jerr.warning) retval = -1;
+  return retval;
+}
+
+/* TurboJPEG 1.1+ */
+DLLEXPORT int tjDecompressHeader2(tjhandle handle, unsigned char *jpegBuf,
+                                  unsigned long jpegSize, int *width,
+                                  int *height, int *jpegSubsamp)
+{
+  int jpegColorspace;
+
+  return tjDecompressHeader3(handle, jpegBuf, jpegSize, width, height,
+                             jpegSubsamp, &jpegColorspace);
+}
+
+/* TurboJPEG 1.0+ */
+DLLEXPORT int tjDecompressHeader(tjhandle handle, unsigned char *jpegBuf,
+                                 unsigned long jpegSize, int *width,
+                                 int *height)
+{
+  int jpegSubsamp;
+
+  return tjDecompressHeader2(handle, jpegBuf, jpegSize, width, height,
+                             &jpegSubsamp);
 }
 
 
-DLLEXPORT int DLLCALL tjDecompress2(tjhandle handle, unsigned char *jpegBuf,
-	unsigned long jpegSize, unsigned char *dstBuf, int width, int pitch,
-	int height, int pixelFormat, int flags)
+/* TurboJPEG 1.2+ */
+DLLEXPORT tjscalingfactor *tjGetScalingFactors(int *numScalingFactors)
 {
-	int i, retval=0;  JSAMPROW *row_pointer=NULL;
-	int jpegwidth, jpegheight, scaledw, scaledh;
-	#ifndef JCS_EXTENSIONS
-	unsigned char *rgbBuf=NULL;
-	unsigned char *_dstBuf=NULL;  int _pitch=0;
-	#endif
+  if (numScalingFactors == NULL) {
+    SNPRINTF(errStr, JMSG_LENGTH_MAX,
+             "tjGetScalingFactors(): Invalid argument");
+    return NULL;
+  }
 
-	getinstance(handle);
-	if((this->init&DECOMPRESS)==0)
-		_throw("tjDecompress2(): Instance has not been initialized for decompression");
-
-	if(jpegBuf==NULL || jpegSize<=0 || dstBuf==NULL || width<0 || pitch<0
-		|| height<0 || pixelFormat<0 || pixelFormat>=TJ_NUMPF)
-		_throw("tjDecompress2(): Invalid argument");
-
-	if(flags&TJFLAG_FORCEMMX) putenv("JSIMD_FORCEMMX=1");
-	else if(flags&TJFLAG_FORCESSE) putenv("JSIMD_FORCESSE=1");
-	else if(flags&TJFLAG_FORCESSE2) putenv("JSIMD_FORCESSE2=1");
-
-	if(setjmp(this->jerr.setjmp_buffer))
-	{
-		/* If we get here, the JPEG code has signaled an error. */
-		retval=-1;
-		goto bailout;
-	}
-
-	jpeg_mem_src_tj(dinfo, jpegBuf, jpegSize);
-	jpeg_read_header(dinfo, TRUE);
-	if(setDecompDefaults(dinfo, pixelFormat, flags)==-1)
-	{
-		retval=-1;  goto bailout;
-	}
-
-	if(flags&TJFLAG_FASTUPSAMPLE) dinfo->do_fancy_upsampling=FALSE;
-
-	jpegwidth=dinfo->image_width;  jpegheight=dinfo->image_height;
-	if(width==0) width=jpegwidth;
-	if(height==0) height=jpegheight;
-	for(i=0; i<NUMSF; i++)
-	{
-		scaledw=TJSCALED(jpegwidth, sf[i]);
-		scaledh=TJSCALED(jpegheight, sf[i]);
-		if(scaledw<=width && scaledh<=height)
-			break;
-	}
-	if(scaledw>width || scaledh>height)
-		_throw("tjDecompress2(): Could not scale down to desired image dimensions");
-	width=scaledw;  height=scaledh;
-	dinfo->scale_num=sf[i].num;
-	dinfo->scale_denom=sf[i].denom;
-
-	jpeg_start_decompress(dinfo);
-	if(pitch==0) pitch=dinfo->output_width*tjPixelSize[pixelFormat];
-
-	#ifndef JCS_EXTENSIONS
-	if(pixelFormat!=TJPF_GRAY &&
-		(RGB_RED!=tjRedOffset[pixelFormat] ||
-			RGB_GREEN!=tjGreenOffset[pixelFormat] ||
-			RGB_BLUE!=tjBlueOffset[pixelFormat] ||
-			RGB_PIXELSIZE!=tjPixelSize[pixelFormat]))
-	{
-		rgbBuf=(unsigned char *)malloc(width*height*3);
-		if(!rgbBuf) _throw("tjDecompress2(): Memory allocation failure");
-		_pitch=pitch;  pitch=width*3;
-		_dstBuf=dstBuf;  dstBuf=rgbBuf;
-	}
-	#endif
-
-	if((row_pointer=(JSAMPROW *)malloc(sizeof(JSAMPROW)
-		*dinfo->output_height))==NULL)
-		_throw("tjDecompress2(): Memory allocation failure");
-	for(i=0; i<(int)dinfo->output_height; i++)
-	{
-		if(flags&TJFLAG_BOTTOMUP)
-			row_pointer[i]=&dstBuf[(dinfo->output_height-i-1)*pitch];
-		else row_pointer[i]=&dstBuf[i*pitch];
-	}
-	while(dinfo->output_scanline<dinfo->output_height)
-	{
-		jpeg_read_scanlines(dinfo, &row_pointer[dinfo->output_scanline],
-			dinfo->output_height-dinfo->output_scanline);
-	}
-	jpeg_finish_decompress(dinfo);
-
-	#ifndef JCS_EXTENSIONS
-	fromRGB(rgbBuf, _dstBuf, width, _pitch, height, pixelFormat);
-	#endif
-
-	bailout:
-	if(dinfo->global_state>DSTATE_START) jpeg_abort_decompress(dinfo);
-	#ifndef JCS_EXTENSIONS
-	if(rgbBuf) free(rgbBuf);
-	#endif
-	if(row_pointer) free(row_pointer);
-	return retval;
-}
-
-DLLEXPORT int DLLCALL tjDecompress(tjhandle handle, unsigned char *jpegBuf,
-	unsigned long jpegSize, unsigned char *dstBuf, int width, int pitch,
-	int height, int pixelSize, int flags)
-{
-	if(flags&TJ_YUV)
-		return tjDecompressToYUV(handle, jpegBuf, jpegSize, dstBuf, flags);
-	else
-		return tjDecompress2(handle, jpegBuf, jpegSize, dstBuf, width, pitch,
-			height, getPixelFormat(pixelSize, flags), flags);
+  *numScalingFactors = NUMSF;
+  return (tjscalingfactor *)sf;
 }
 
 
-DLLEXPORT int DLLCALL tjDecompressToYUV(tjhandle handle,
-	unsigned char *jpegBuf, unsigned long jpegSize, unsigned char *dstBuf,
-	int flags)
+/* TurboJPEG 1.2+ */
+DLLEXPORT int tjDecompress2(tjhandle handle, const unsigned char *jpegBuf,
+                            unsigned long jpegSize, unsigned char *dstBuf,
+                            int width, int pitch, int height, int pixelFormat,
+                            int flags)
 {
-	int i, row, retval=0;  JSAMPROW *outbuf[MAX_COMPONENTS];
-	int cw[MAX_COMPONENTS], ch[MAX_COMPONENTS], iw[MAX_COMPONENTS],
-		tmpbufsize=0, usetmpbuf=0, th[MAX_COMPONENTS];
-	JSAMPLE *_tmpbuf=NULL, *ptr=dstBuf;  JSAMPROW *tmpbuf[MAX_COMPONENTS];
+  JSAMPROW *row_pointer = NULL;
+  int i, retval = 0, jpegwidth, jpegheight, scaledw, scaledh;
+  struct my_progress_mgr progress;
+#ifndef JCS_EXTENSIONS
+  unsigned char *rgbBuf = NULL, *_dstBuf = NULL;
+  int _pitch = 0;
+#endif
 
-	getinstance(handle);
+  GET_DINSTANCE(handle);
+  this->jerr.stopOnWarning = (flags & TJFLAG_STOPONWARNING) ? TRUE : FALSE;
+  if ((this->init & DECOMPRESS) == 0)
+    THROW("tjDecompress2(): Instance has not been initialized for decompression");
 
-	for(i=0; i<MAX_COMPONENTS; i++)
-	{
-		tmpbuf[i]=NULL;  outbuf[i]=NULL;
-	}
+  if (jpegBuf == NULL || jpegSize <= 0 || dstBuf == NULL || width < 0 ||
+      pitch < 0 || height < 0 || pixelFormat < 0 || pixelFormat >= TJ_NUMPF)
+    THROW("tjDecompress2(): Invalid argument");
 
-	if((this->init&DECOMPRESS)==0)
-		_throw("tjDecompressToYUV(): Instance has not been initialized for decompression");
+#ifndef NO_PUTENV
+  if (flags & TJFLAG_FORCEMMX) PUTENV_S("JSIMD_FORCEMMX", "1");
+  else if (flags & TJFLAG_FORCESSE) PUTENV_S("JSIMD_FORCESSE", "1");
+  else if (flags & TJFLAG_FORCESSE2) PUTENV_S("JSIMD_FORCESSE2", "1");
+#endif
 
-	if(jpegBuf==NULL || jpegSize<=0 || dstBuf==NULL)
-		_throw("tjDecompressToYUV(): Invalid argument");
+  if (flags & TJFLAG_LIMITSCANS) {
+    memset(&progress, 0, sizeof(struct my_progress_mgr));
+    progress.pub.progress_monitor = my_progress_monitor;
+    progress.this = this;
+    dinfo->progress = &progress.pub;
+  } else
+    dinfo->progress = NULL;
 
-	if(flags&TJFLAG_FORCEMMX) putenv("JSIMD_FORCEMMX=1");
-	else if(flags&TJFLAG_FORCESSE) putenv("JSIMD_FORCESSE=1");
-	else if(flags&TJFLAG_FORCESSE2) putenv("JSIMD_FORCESSE2=1");
+  if (setjmp(this->jerr.setjmp_buffer)) {
+    /* If we get here, the JPEG code has signaled an error. */
+    retval = -1;  goto bailout;
+  }
 
-	if(setjmp(this->jerr.setjmp_buffer))
-	{
-		/* If we get here, the JPEG code has signaled an error. */
-		retval=-1;
-		goto bailout;
-	}
+  jpeg_mem_src_tj(dinfo, jpegBuf, jpegSize);
+  jpeg_read_header(dinfo, TRUE);
+  this->dinfo.out_color_space = pf2cs[pixelFormat];
+  if (flags & TJFLAG_FASTDCT) this->dinfo.dct_method = JDCT_FASTEST;
+  if (flags & TJFLAG_FASTUPSAMPLE) dinfo->do_fancy_upsampling = FALSE;
 
-	jpeg_mem_src_tj(dinfo, jpegBuf, jpegSize);
-	jpeg_read_header(dinfo, TRUE);
+  jpegwidth = dinfo->image_width;  jpegheight = dinfo->image_height;
+  if (width == 0) width = jpegwidth;
+  if (height == 0) height = jpegheight;
+  for (i = 0; i < NUMSF; i++) {
+    scaledw = TJSCALED(jpegwidth, sf[i]);
+    scaledh = TJSCALED(jpegheight, sf[i]);
+    if (scaledw <= width && scaledh <= height)
+      break;
+  }
+  if (i >= NUMSF)
+    THROW("tjDecompress2(): Could not scale down to desired image dimensions");
+  width = scaledw;  height = scaledh;
+  dinfo->scale_num = sf[i].num;
+  dinfo->scale_denom = sf[i].denom;
 
-	for(i=0; i<dinfo->num_components; i++)
-	{
-		jpeg_component_info *compptr=&dinfo->comp_info[i];
-		int ih;
-		iw[i]=compptr->width_in_blocks*DCTSIZE;
-		ih=compptr->height_in_blocks*DCTSIZE;
-		cw[i]=PAD(dinfo->image_width, dinfo->max_h_samp_factor)
-			*compptr->h_samp_factor/dinfo->max_h_samp_factor;
-		ch[i]=PAD(dinfo->image_height, dinfo->max_v_samp_factor)
-			*compptr->v_samp_factor/dinfo->max_v_samp_factor;
-		if(iw[i]!=cw[i] || ih!=ch[i]) usetmpbuf=1;
-		th[i]=compptr->v_samp_factor*DCTSIZE;
-		tmpbufsize+=iw[i]*th[i];
-		if((outbuf[i]=(JSAMPROW *)malloc(sizeof(JSAMPROW)*ch[i]))==NULL)
-			_throw("tjDecompressToYUV(): Memory allocation failure");
-		for(row=0; row<ch[i]; row++)
-		{
-			outbuf[i][row]=ptr;
-			ptr+=PAD(cw[i], 4);
-		}
-	}
-	if(usetmpbuf)
-	{
-		if((_tmpbuf=(JSAMPLE *)malloc(sizeof(JSAMPLE)*tmpbufsize))==NULL)
-			_throw("tjDecompressToYUV(): Memory allocation failure");
-		ptr=_tmpbuf;
-		for(i=0; i<dinfo->num_components; i++)
-		{
-			if((tmpbuf[i]=(JSAMPROW *)malloc(sizeof(JSAMPROW)*th[i]))==NULL)
-				_throw("tjDecompressToYUV(): Memory allocation failure");
-			for(row=0; row<th[i]; row++)
-			{
-				tmpbuf[i][row]=ptr;
-				ptr+=iw[i];
-			}
-		}
-	}
+  jpeg_start_decompress(dinfo);
+  if (pitch == 0) pitch = dinfo->output_width * tjPixelSize[pixelFormat];
 
-	if(flags&TJFLAG_FASTUPSAMPLE) dinfo->do_fancy_upsampling=FALSE;
-	if(flags&TJFLAG_FASTDCT) dinfo->dct_method=JDCT_FASTEST;
-	dinfo->raw_data_out=TRUE;
+#ifndef JCS_EXTENSIONS
+  if (pixelFormat != TJPF_GRAY && pixelFormat != TJPF_CMYK &&
+      (tjRedOffset[pixelFormat] != RGB_RED ||
+       tjGreenOffset[pixelFormat] != RGB_GREEN ||
+       tjBlueOffset[pixelFormat] != RGB_BLUE ||
+       tjPixelSize[pixelFormat] != RGB_PIXELSIZE ||
+       (pixelFormat >= TJPF_RGBA && pixelFormat <= TJPF_ARGB))) {
+    rgbBuf = (unsigned char *)malloc(width * height * RGB_PIXELSIZE);
+    if (!rgbBuf) THROW("tjDecompress2(): Memory allocation failure")
+    _pitch = pitch;  pitch = width * RGB_PIXELSIZE;
+    _dstBuf = dstBuf;  dstBuf = rgbBuf;
+    this->dinfo.out_color_space = JCS_RGB;
+  }
+#endif
 
-	jpeg_start_decompress(dinfo);
-	for(row=0; row<(int)dinfo->output_height;
-		row+=dinfo->max_v_samp_factor*DCTSIZE)
-	{
-		JSAMPARRAY yuvptr[MAX_COMPONENTS];
-		int crow[MAX_COMPONENTS];
-		for(i=0; i<dinfo->num_components; i++)
-		{
-			jpeg_component_info *compptr=&dinfo->comp_info[i];
-			crow[i]=row*compptr->v_samp_factor/dinfo->max_v_samp_factor;
-			if(usetmpbuf) yuvptr[i]=tmpbuf[i];
-			else yuvptr[i]=&outbuf[i][crow[i]];
-		}
-		jpeg_read_raw_data(dinfo, yuvptr, dinfo->max_v_samp_factor*DCTSIZE);
-		if(usetmpbuf)
-		{
-			int j;
-			for(i=0; i<dinfo->num_components; i++)
-			{
-				for(j=0; j<min(th[i], ch[i]-crow[i]); j++)
-				{
-					memcpy(outbuf[i][crow[i]+j], tmpbuf[i][j], cw[i]);
-				}
-			}
-		}
-	}
-	jpeg_finish_decompress(dinfo);
+  if ((row_pointer =
+       (JSAMPROW *)malloc(sizeof(JSAMPROW) * dinfo->output_height)) == NULL)
+    THROW("tjDecompress2(): Memory allocation failure");
+  if (setjmp(this->jerr.setjmp_buffer)) {
+    /* If we get here, the JPEG code has signaled an error. */
+    retval = -1;  goto bailout;
+  }
+  for (i = 0; i < (int)dinfo->output_height; i++) {
+    if (flags & TJFLAG_BOTTOMUP)
+      row_pointer[i] = &dstBuf[(dinfo->output_height - i - 1) * (size_t)pitch];
+    else
+      row_pointer[i] = &dstBuf[i * (size_t)pitch];
+  }
+  while (dinfo->output_scanline < dinfo->output_height)
+    jpeg_read_scanlines(dinfo, &row_pointer[dinfo->output_scanline],
+                        dinfo->output_height - dinfo->output_scanline);
+  jpeg_finish_decompress(dinfo);
 
-	bailout:
-	if(dinfo->global_state>DSTATE_START) jpeg_abort_decompress(dinfo);
-	for(i=0; i<MAX_COMPONENTS; i++)
-	{
-		if(tmpbuf[i]) free(tmpbuf[i]);
-		if(outbuf[i]) free(outbuf[i]);
-	}
-	if(_tmpbuf) free(_tmpbuf);
-	return retval;
+#ifndef JCS_EXTENSIONS
+  if (dstBuf == rgbBuf)
+    fromRGB(rgbBuf, RGB_RED, RGB_GREEN, RGB_BLUE, RGB_PIXELSIZE, _dstBuf,
+            width, _pitch, height, pixelFormat);
+#endif
+
+bailout:
+  if (dinfo->global_state > DSTATE_START) jpeg_abort_decompress(dinfo);
+#ifndef JCS_EXTENSIONS
+  free(rgbBuf);
+#endif
+  free(row_pointer);
+  if (this->jerr.warning) retval = -1;
+  this->jerr.stopOnWarning = FALSE;
+  return retval;
+}
+
+/* TurboJPEG 1.0+ */
+DLLEXPORT int tjDecompress(tjhandle handle, unsigned char *jpegBuf,
+                           unsigned long jpegSize, unsigned char *dstBuf,
+                           int width, int pitch, int height, int pixelSize,
+                           int flags)
+{
+  if (flags & TJ_YUV)
+    return tjDecompressToYUV(handle, jpegBuf, jpegSize, dstBuf, flags);
+  else
+    return tjDecompress2(handle, jpegBuf, jpegSize, dstBuf, width, pitch,
+                         height, getPixelFormat(pixelSize, flags), flags);
 }
 
 
-/* Transformer */
-
-DLLEXPORT tjhandle DLLCALL tjInitTransform(void)
+static void setDecodeDefaults(struct jpeg_decompress_struct *dinfo,
+                              int pixelFormat, int subsamp, int flags)
 {
-	tjinstance *this=NULL;  tjhandle handle=NULL;
-	if((this=(tjinstance *)malloc(sizeof(tjinstance)))==NULL)
-	{
-		snprintf(errStr, JMSG_LENGTH_MAX,
-			"tjInitTransform(): Memory allocation failure");
-		return NULL;
-	}
-	MEMZERO(this, sizeof(tjinstance));
-	handle=_tjInitCompress(this);
-	if(!handle) return NULL;
-	handle=_tjInitDecompress(this);
-	return handle;
+  int i;
+
+  dinfo->scale_num = dinfo->scale_denom = 1;
+
+  if (subsamp == TJSAMP_GRAY) {
+    dinfo->num_components = dinfo->comps_in_scan = 1;
+    dinfo->jpeg_color_space = JCS_GRAYSCALE;
+  } else {
+    dinfo->num_components = dinfo->comps_in_scan = 3;
+    dinfo->jpeg_color_space = JCS_YCbCr;
+  }
+
+  dinfo->comp_info = (jpeg_component_info *)
+    (*dinfo->mem->alloc_small) ((j_common_ptr)dinfo, JPOOL_IMAGE,
+                                dinfo->num_components *
+                                sizeof(jpeg_component_info));
+
+  for (i = 0; i < dinfo->num_components; i++) {
+    jpeg_component_info *compptr = &dinfo->comp_info[i];
+
+    compptr->h_samp_factor = (i == 0) ? tjMCUWidth[subsamp] / 8 : 1;
+    compptr->v_samp_factor = (i == 0) ? tjMCUHeight[subsamp] / 8 : 1;
+    compptr->component_index = i;
+    compptr->component_id = i + 1;
+    compptr->quant_tbl_no = compptr->dc_tbl_no =
+      compptr->ac_tbl_no = (i == 0) ? 0 : 1;
+    dinfo->cur_comp_info[i] = compptr;
+  }
+  dinfo->data_precision = 8;
+  for (i = 0; i < 2; i++) {
+    if (dinfo->quant_tbl_ptrs[i] == NULL)
+      dinfo->quant_tbl_ptrs[i] = jpeg_alloc_quant_table((j_common_ptr)dinfo);
+  }
 }
 
 
-DLLEXPORT int DLLCALL tjTransform(tjhandle handle, unsigned char *jpegBuf,
-	unsigned long jpegSize, int n, unsigned char **dstBufs,
-	unsigned long *dstSizes, tjtransform *t, int flags)
+static int my_read_markers(j_decompress_ptr dinfo)
 {
-	jpeg_transform_info *xinfo=NULL;
-	jvirt_barray_ptr *srccoefs, *dstcoefs;
-	int retval=0, i, jpegSubsamp;
+  return JPEG_REACHED_SOS;
+}
 
-	getinstance(handle);
-	if((this->init&COMPRESS)==0 || (this->init&DECOMPRESS)==0)
-		_throw("tjTransform(): Instance has not been initialized for transformation");
+static void my_reset_marker_reader(j_decompress_ptr dinfo)
+{
+}
 
-	if(jpegBuf==NULL || jpegSize<=0 || n<1 || dstBufs==NULL || dstSizes==NULL
-		|| t==NULL || flags<0)
-		_throw("tjTransform(): Invalid argument");
+/* TurboJPEG 1.4+ */
+DLLEXPORT int tjDecodeYUVPlanes(tjhandle handle,
+                                const unsigned char **srcPlanes,
+                                const int *strides, int subsamp,
+                                unsigned char *dstBuf, int width, int pitch,
+                                int height, int pixelFormat, int flags)
+{
+  JSAMPROW *row_pointer = NULL;
+  JSAMPLE *_tmpbuf[MAX_COMPONENTS];
+  JSAMPROW *tmpbuf[MAX_COMPONENTS], *inbuf[MAX_COMPONENTS];
+  int i, retval = 0, row, pw0, ph0, pw[MAX_COMPONENTS], ph[MAX_COMPONENTS];
+  JSAMPLE *ptr;
+  jpeg_component_info *compptr;
+  int (*old_read_markers) (j_decompress_ptr);
+  void (*old_reset_marker_reader) (j_decompress_ptr);
+#ifndef JCS_EXTENSIONS
+  unsigned char *rgbBuf = NULL, *_dstBuf = NULL;
+  int _pitch = 0;
+#endif
 
-	if(flags&TJFLAG_FORCEMMX) putenv("JSIMD_FORCEMMX=1");
-	else if(flags&TJFLAG_FORCESSE) putenv("JSIMD_FORCESSE=1");
-	else if(flags&TJFLAG_FORCESSE2) putenv("JSIMD_FORCESSE2=1");
+  GET_DINSTANCE(handle);
+  this->jerr.stopOnWarning = (flags & TJFLAG_STOPONWARNING) ? TRUE : FALSE;
 
-	if(setjmp(this->jerr.setjmp_buffer))
-	{
-		/* If we get here, the JPEG code has signaled an error. */
-		retval=-1;
-		goto bailout;
-	}
+  for (i = 0; i < MAX_COMPONENTS; i++) {
+    tmpbuf[i] = NULL;  _tmpbuf[i] = NULL;  inbuf[i] = NULL;
+  }
 
-	jpeg_mem_src_tj(dinfo, jpegBuf, jpegSize);
+  if ((this->init & DECOMPRESS) == 0)
+    THROW("tjDecodeYUVPlanes(): Instance has not been initialized for decompression");
 
-	if((xinfo=(jpeg_transform_info *)malloc(sizeof(jpeg_transform_info)*n))
-		==NULL)
-		_throw("tjTransform(): Memory allocation failure");
-	MEMZERO(xinfo, sizeof(jpeg_transform_info)*n);
+  if (!srcPlanes || !srcPlanes[0] || subsamp < 0 || subsamp >= TJ_NUMSAMP ||
+      dstBuf == NULL || width <= 0 || pitch < 0 || height <= 0 ||
+      pixelFormat < 0 || pixelFormat >= TJ_NUMPF)
+    THROW("tjDecodeYUVPlanes(): Invalid argument");
+  if (subsamp != TJSAMP_GRAY && (!srcPlanes[1] || !srcPlanes[2]))
+    THROW("tjDecodeYUVPlanes(): Invalid argument");
 
-	for(i=0; i<n; i++)
-	{
-		xinfo[i].transform=xformtypes[t[i].op];
-		xinfo[i].perfect=(t[i].options&TJXOPT_PERFECT)? 1:0;
-		xinfo[i].trim=(t[i].options&TJXOPT_TRIM)? 1:0;
-		xinfo[i].force_grayscale=(t[i].options&TJXOPT_GRAY)? 1:0;
-		xinfo[i].crop=(t[i].options&TJXOPT_CROP)? 1:0;
-		if(n!=1 && t[i].op==TJXOP_HFLIP) xinfo[i].slow_hflip=1;
-		else xinfo[i].slow_hflip=0;
+  if (setjmp(this->jerr.setjmp_buffer)) {
+    /* If we get here, the JPEG code has signaled an error. */
+    retval = -1;  goto bailout;
+  }
 
-		if(xinfo[i].crop)
-		{
-			xinfo[i].crop_xoffset=t[i].r.x;  xinfo[i].crop_xoffset_set=JCROP_POS;
-			xinfo[i].crop_yoffset=t[i].r.y;  xinfo[i].crop_yoffset_set=JCROP_POS;
-			if(t[i].r.w!=0)
-			{
-				xinfo[i].crop_width=t[i].r.w;  xinfo[i].crop_width_set=JCROP_POS;
-			}
-			else xinfo[i].crop_width=JCROP_UNSET;
-			if(t[i].r.h!=0)
-			{
-				xinfo[i].crop_height=t[i].r.h;  xinfo[i].crop_height_set=JCROP_POS;
-			}
-			else xinfo[i].crop_height=JCROP_UNSET;
-		}
-	}
+  if (pixelFormat == TJPF_CMYK)
+    THROW("tjDecodeYUVPlanes(): Cannot decode YUV images into packed-pixel CMYK images.");
 
-	jcopy_markers_setup(dinfo, JCOPYOPT_ALL);
-	jpeg_read_header(dinfo, TRUE);
-	jpegSubsamp=getSubsamp(dinfo);
-	if(jpegSubsamp<0)
-		_throw("tjTransform(): Could not determine subsampling type for JPEG image");
+  if (pitch == 0) pitch = width * tjPixelSize[pixelFormat];
+  dinfo->image_width = width;
+  dinfo->image_height = height;
 
-	for(i=0; i<n; i++)
-	{
-		if(!jtransform_request_workspace(dinfo, &xinfo[i]))
-			_throw("tjTransform(): Transform is not perfect");
+#ifndef NO_PUTENV
+  if (flags & TJFLAG_FORCEMMX) PUTENV_S("JSIMD_FORCEMMX", "1");
+  else if (flags & TJFLAG_FORCESSE) PUTENV_S("JSIMD_FORCESSE", "1");
+  else if (flags & TJFLAG_FORCESSE2) PUTENV_S("JSIMD_FORCESSE2", "1");
+#endif
 
-		if(xinfo[i].crop)
-		{
-			if((t[i].r.x%xinfo[i].iMCU_sample_width)!=0
-				|| (t[i].r.y%xinfo[i].iMCU_sample_height)!=0)
-			{
-				snprintf(errStr, JMSG_LENGTH_MAX,
-					"To crop this JPEG image, x must be a multiple of %d\n"
-					"and y must be a multiple of %d.\n",
-					xinfo[i].iMCU_sample_width, xinfo[i].iMCU_sample_height);
-				retval=-1;  goto bailout;
-			}
-		}
-	}
+  dinfo->progressive_mode = dinfo->inputctl->has_multiple_scans = FALSE;
+#ifndef LIBJPEG_TURBO_VERSION
+  dinfo->arith_code = TRUE;
+#endif
+  dinfo->Ss = dinfo->Ah = dinfo->Al = 0;
+  dinfo->Se = DCTSIZE2 - 1;
+  setDecodeDefaults(dinfo, pixelFormat, subsamp, flags);
+  old_read_markers = dinfo->marker->read_markers;
+  dinfo->marker->read_markers = my_read_markers;
+  old_reset_marker_reader = dinfo->marker->reset_marker_reader;
+  dinfo->marker->reset_marker_reader = my_reset_marker_reader;
+  jpeg_read_header(dinfo, TRUE);
+  dinfo->marker->read_markers = old_read_markers;
+  dinfo->marker->reset_marker_reader = old_reset_marker_reader;
 
-	srccoefs=jpeg_read_coefficients(dinfo);
+  this->dinfo.out_color_space = pf2cs[pixelFormat];
+  if (flags & TJFLAG_FASTDCT) this->dinfo.dct_method = JDCT_FASTEST;
+  dinfo->do_fancy_upsampling = FALSE;
+  dinfo->Se = DCTSIZE2 - 1;
+  jinit_master_decompress(dinfo);
+  (*dinfo->upsample->start_pass) (dinfo);
 
-	for(i=0; i<n; i++)
-	{
-		int w, h, alloc=1;
-		if(!xinfo[i].crop)
-		{
-			w=dinfo->image_width;  h=dinfo->image_height;
-		}
-		else
-		{
-			w=xinfo[i].crop_width;  h=xinfo[i].crop_height;
-		}
-		if(flags&TJFLAG_NOREALLOC)
-		{
-			alloc=0;  dstSizes[i]=tjBufSize(w, h, jpegSubsamp);
-		}
-		if(!(t[i].options&TJXOPT_NOOUTPUT))
-			jpeg_mem_dest_tj(cinfo, &dstBufs[i], &dstSizes[i], alloc);
-		jpeg_copy_critical_parameters(dinfo, cinfo);
-		dstcoefs=jtransform_adjust_parameters(dinfo, cinfo, srccoefs,
-			&xinfo[i]);
-		if(flags&TJFLAG_PROGRESSIVE || t[i].options&TJXOPT_PROGRESSIVE)
-			jpeg_simple_progression(cinfo);
-		if(!(t[i].options&TJXOPT_NOOUTPUT))
-		{
-			jpeg_write_coefficients(cinfo, dstcoefs);
-			jcopy_markers_execute(dinfo, cinfo, JCOPYOPT_ALL);
-		}
-		else jinit_c_master_control(cinfo, TRUE);
-		jtransform_execute_transformation(dinfo, cinfo, srccoefs,
-			&xinfo[i]);
-		if(t[i].customFilter)
-		{
-			int ci, y;  JDIMENSION by;
-			for(ci=0; ci<cinfo->num_components; ci++)
-			{
-				jpeg_component_info *compptr=&cinfo->comp_info[ci];
-				tjregion arrayRegion={0, 0, compptr->width_in_blocks*DCTSIZE,
-					DCTSIZE};
-				tjregion planeRegion={0, 0, compptr->width_in_blocks*DCTSIZE,
-					compptr->height_in_blocks*DCTSIZE};
-				for(by=0; by<compptr->height_in_blocks; by+=compptr->v_samp_factor)
-				{
-					JBLOCKARRAY barray=(dinfo->mem->access_virt_barray)
-						((j_common_ptr)dinfo, dstcoefs[ci], by, compptr->v_samp_factor,
-						TRUE);
-					for(y=0; y<compptr->v_samp_factor; y++)
-					{
-						if(t[i].customFilter(barray[y][0], arrayRegion, planeRegion,
-							ci, i, &t[i])==-1)
-							_throw("tjTransform(): Error in custom filter");
-						arrayRegion.y+=DCTSIZE;
-					}
-				}
-			}
-		}
-		if(!(t[i].options&TJXOPT_NOOUTPUT)) jpeg_finish_compress(cinfo);
-	}
+  pw0 = PAD(width, dinfo->max_h_samp_factor);
+  ph0 = PAD(height, dinfo->max_v_samp_factor);
 
-	jpeg_finish_decompress(dinfo);
+  if (pitch == 0) pitch = dinfo->output_width * tjPixelSize[pixelFormat];
 
-	bailout:
-	if(cinfo->global_state>CSTATE_START) jpeg_abort_compress(cinfo);
-	if(dinfo->global_state>DSTATE_START) jpeg_abort_decompress(dinfo);
-	if(xinfo) free(xinfo);
-	return retval;
+#ifndef JCS_EXTENSIONS
+  if (pixelFormat != TJPF_GRAY &&
+      (tjRedOffset[pixelFormat] != RGB_RED ||
+       tjGreenOffset[pixelFormat] != RGB_GREEN ||
+       tjBlueOffset[pixelFormat] != RGB_BLUE ||
+       tjPixelSize[pixelFormat] != RGB_PIXELSIZE ||
+       (pixelFormat >= TJPF_RGBA && pixelFormat <= TJPF_ARGB))) {
+    rgbBuf = (unsigned char *)malloc(width * height * RGB_PIXELSIZE);
+    if (!rgbBuf) THROW("tjDecodeYUVPlanes(): Memory allocation failure")
+    _pitch = pitch;  pitch = width * RGB_PIXELSIZE;
+    _dstBuf = dstBuf;  dstBuf = rgbBuf;
+    this->dinfo.out_color_space = JCS_RGB;
+  }
+#endif
+
+  if ((row_pointer = (JSAMPROW *)malloc(sizeof(JSAMPROW) * ph0)) == NULL)
+    THROW("tjDecodeYUVPlanes(): Memory allocation failure");
+  for (i = 0; i < height; i++) {
+    if (flags & TJFLAG_BOTTOMUP)
+      row_pointer[i] = &dstBuf[(height - i - 1) * (size_t)pitch];
+    else
+      row_pointer[i] = &dstBuf[i * (size_t)pitch];
+  }
+  if (height < ph0)
+    for (i = height; i < ph0; i++) row_pointer[i] = row_pointer[height - 1];
+
+  for (i = 0; i < dinfo->num_components; i++) {
+    compptr = &dinfo->comp_info[i];
+    _tmpbuf[i] =
+      (JSAMPLE *)malloc(PAD(compptr->width_in_blocks * DCTSIZE, 32) *
+                        compptr->v_samp_factor + 32);
+    if (!_tmpbuf[i])
+      THROW("tjDecodeYUVPlanes(): Memory allocation failure");
+    tmpbuf[i] = (JSAMPROW *)malloc(sizeof(JSAMPROW) * compptr->v_samp_factor);
+    if (!tmpbuf[i])
+      THROW("tjDecodeYUVPlanes(): Memory allocation failure");
+    for (row = 0; row < compptr->v_samp_factor; row++) {
+      unsigned char *_tmpbuf_aligned =
+        (unsigned char *)PAD((JUINTPTR)_tmpbuf[i], 32);
+
+      tmpbuf[i][row] =
+        &_tmpbuf_aligned[PAD(compptr->width_in_blocks * DCTSIZE, 32) * row];
+    }
+    pw[i] = pw0 * compptr->h_samp_factor / dinfo->max_h_samp_factor;
+    ph[i] = ph0 * compptr->v_samp_factor / dinfo->max_v_samp_factor;
+    inbuf[i] = (JSAMPROW *)malloc(sizeof(JSAMPROW) * ph[i]);
+    if (!inbuf[i])
+      THROW("tjDecodeYUVPlanes(): Memory allocation failure");
+    ptr = (JSAMPLE *)srcPlanes[i];
+    for (row = 0; row < ph[i]; row++) {
+      inbuf[i][row] = ptr;
+      ptr += (strides && strides[i] != 0) ? strides[i] : pw[i];
+    }
+  }
+
+  if (setjmp(this->jerr.setjmp_buffer)) {
+    /* If we get here, the JPEG code has signaled an error. */
+    retval = -1;  goto bailout;
+  }
+
+  for (row = 0; row < ph0; row += dinfo->max_v_samp_factor) {
+    JDIMENSION inrow = 0, outrow = 0;
+
+    for (i = 0, compptr = dinfo->comp_info; i < dinfo->num_components;
+         i++, compptr++)
+      jcopy_sample_rows(inbuf[i],
+        row * compptr->v_samp_factor / dinfo->max_v_samp_factor, tmpbuf[i], 0,
+        compptr->v_samp_factor, pw[i]);
+    (dinfo->upsample->upsample) (dinfo, tmpbuf, &inrow,
+                                 dinfo->max_v_samp_factor, &row_pointer[row],
+                                 &outrow, dinfo->max_v_samp_factor);
+  }
+  jpeg_abort_decompress(dinfo);
+
+#ifndef JCS_EXTENSIONS
+  if (dstBuf == rgbBuf)
+    fromRGB(rgbBuf, RGB_RED, RGB_GREEN, RGB_BLUE, RGB_PIXELSIZE, _dstBuf,
+            width, _pitch, height, pixelFormat);
+#endif
+
+bailout:
+  if (dinfo->global_state > DSTATE_START) jpeg_abort_decompress(dinfo);
+#ifndef JCS_EXTENSIONS
+  free(rgbBuf);
+#endif
+  free(row_pointer);
+  for (i = 0; i < MAX_COMPONENTS; i++) {
+    free(tmpbuf[i]);
+    free(_tmpbuf[i]);
+    free(inbuf[i]);
+  }
+  if (this->jerr.warning) retval = -1;
+  this->jerr.stopOnWarning = FALSE;
+  return retval;
+}
+
+/* TurboJPEG 1.4+ */
+DLLEXPORT int tjDecodeYUV(tjhandle handle, const unsigned char *srcBuf,
+                          int align, int subsamp, unsigned char *dstBuf,
+                          int width, int pitch, int height, int pixelFormat,
+                          int flags)
+{
+  const unsigned char *srcPlanes[3];
+  int pw0, ph0, strides[3], retval = -1;
+  tjinstance *this = (tjinstance *)handle;
+
+  if (!this) THROWG("tjDecodeYUV(): Invalid handle");
+  this->isInstanceError = FALSE;
+
+  if (srcBuf == NULL || align < 1 || !IS_POW2(align) || subsamp < 0 ||
+      subsamp >= TJ_NUMSAMP || width <= 0 || height <= 0)
+    THROW("tjDecodeYUV(): Invalid argument");
+
+  pw0 = tjPlaneWidth(0, width, subsamp);
+  ph0 = tjPlaneHeight(0, height, subsamp);
+  srcPlanes[0] = srcBuf;
+  strides[0] = PAD(pw0, align);
+  if (subsamp == TJSAMP_GRAY) {
+    strides[1] = strides[2] = 0;
+    srcPlanes[1] = srcPlanes[2] = NULL;
+  } else {
+    int pw1 = tjPlaneWidth(1, width, subsamp);
+    int ph1 = tjPlaneHeight(1, height, subsamp);
+
+    strides[1] = strides[2] = PAD(pw1, align);
+    if ((unsigned long long)strides[0] * (unsigned long long)ph0 >
+        (unsigned long long)INT_MAX ||
+        (unsigned long long)strides[1] * (unsigned long long)ph1 >
+        (unsigned long long)INT_MAX)
+      THROW("Image or row alignment is too large");
+    srcPlanes[1] = srcPlanes[0] + strides[0] * ph0;
+    srcPlanes[2] = srcPlanes[1] + strides[1] * ph1;
+  }
+
+  return tjDecodeYUVPlanes(handle, srcPlanes, strides, subsamp, dstBuf, width,
+                           pitch, height, pixelFormat, flags);
+
+bailout:
+  return retval;
+}
+
+/* TurboJPEG 1.4+ */
+DLLEXPORT int tjDecompressToYUVPlanes(tjhandle handle,
+                                      const unsigned char *jpegBuf,
+                                      unsigned long jpegSize,
+                                      unsigned char **dstPlanes, int width,
+                                      int *strides, int height, int flags)
+{
+  int i, sfi, row, retval = 0;
+  int jpegwidth, jpegheight, jpegSubsamp, scaledw, scaledh;
+  int pw[MAX_COMPONENTS], ph[MAX_COMPONENTS], iw[MAX_COMPONENTS],
+    tmpbufsize = 0, usetmpbuf = 0, th[MAX_COMPONENTS];
+  JSAMPLE *_tmpbuf = NULL, *ptr;
+  JSAMPROW *outbuf[MAX_COMPONENTS], *tmpbuf[MAX_COMPONENTS];
+  int dctsize;
+  struct my_progress_mgr progress;
+
+  GET_DINSTANCE(handle);
+  this->jerr.stopOnWarning = (flags & TJFLAG_STOPONWARNING) ? TRUE : FALSE;
+
+  for (i = 0; i < MAX_COMPONENTS; i++) {
+    tmpbuf[i] = NULL;  outbuf[i] = NULL;
+  }
+
+  if ((this->init & DECOMPRESS) == 0)
+    THROW("tjDecompressToYUVPlanes(): Instance has not been initialized for decompression");
+
+  if (jpegBuf == NULL || jpegSize <= 0 || !dstPlanes || !dstPlanes[0] ||
+      width < 0 || height < 0)
+    THROW("tjDecompressToYUVPlanes(): Invalid argument");
+
+#ifndef NO_PUTENV
+  if (flags & TJFLAG_FORCEMMX) PUTENV_S("JSIMD_FORCEMMX", "1");
+  else if (flags & TJFLAG_FORCESSE) PUTENV_S("JSIMD_FORCESSE", "1");
+  else if (flags & TJFLAG_FORCESSE2) PUTENV_S("JSIMD_FORCESSE2", "1");
+#endif
+
+  if (flags & TJFLAG_LIMITSCANS) {
+    memset(&progress, 0, sizeof(struct my_progress_mgr));
+    progress.pub.progress_monitor = my_progress_monitor;
+    progress.this = this;
+    dinfo->progress = &progress.pub;
+  } else
+    dinfo->progress = NULL;
+
+  if (setjmp(this->jerr.setjmp_buffer)) {
+    /* If we get here, the JPEG code has signaled an error. */
+    retval = -1;  goto bailout;
+  }
+
+  if (!this->headerRead) {
+    jpeg_mem_src_tj(dinfo, jpegBuf, jpegSize);
+    jpeg_read_header(dinfo, TRUE);
+  }
+  this->headerRead = 0;
+  jpegSubsamp = getSubsamp(dinfo);
+  if (jpegSubsamp < 0)
+    THROW("tjDecompressToYUVPlanes(): Could not determine subsampling type for JPEG image");
+
+  if (jpegSubsamp != TJSAMP_GRAY && (!dstPlanes[1] || !dstPlanes[2]))
+    THROW("tjDecompressToYUVPlanes(): Invalid argument");
+
+  jpegwidth = dinfo->image_width;  jpegheight = dinfo->image_height;
+  if (width == 0) width = jpegwidth;
+  if (height == 0) height = jpegheight;
+  for (i = 0; i < NUMSF; i++) {
+    scaledw = TJSCALED(jpegwidth, sf[i]);
+    scaledh = TJSCALED(jpegheight, sf[i]);
+    if (scaledw <= width && scaledh <= height)
+      break;
+  }
+  if (i >= NUMSF)
+    THROW("tjDecompressToYUVPlanes(): Could not scale down to desired image dimensions");
+  if (dinfo->num_components > 3)
+    THROW("tjDecompressToYUVPlanes(): JPEG image must have 3 or fewer components");
+
+  width = scaledw;  height = scaledh;
+  dinfo->scale_num = sf[i].num;
+  dinfo->scale_denom = sf[i].denom;
+  sfi = i;
+  jpeg_calc_output_dimensions(dinfo);
+
+  dctsize = DCTSIZE * sf[sfi].num / sf[sfi].denom;
+
+  for (i = 0; i < dinfo->num_components; i++) {
+    jpeg_component_info *compptr = &dinfo->comp_info[i];
+    int ih;
+
+    iw[i] = compptr->width_in_blocks * dctsize;
+    ih = compptr->height_in_blocks * dctsize;
+    pw[i] = tjPlaneWidth(i, dinfo->output_width, jpegSubsamp);
+    ph[i] = tjPlaneHeight(i, dinfo->output_height, jpegSubsamp);
+    if (iw[i] != pw[i] || ih != ph[i]) usetmpbuf = 1;
+    th[i] = compptr->v_samp_factor * dctsize;
+    tmpbufsize += iw[i] * th[i];
+    if ((outbuf[i] = (JSAMPROW *)malloc(sizeof(JSAMPROW) * ph[i])) == NULL)
+      THROW("tjDecompressToYUVPlanes(): Memory allocation failure");
+    ptr = dstPlanes[i];
+    for (row = 0; row < ph[i]; row++) {
+      outbuf[i][row] = ptr;
+      ptr += (strides && strides[i] != 0) ? strides[i] : pw[i];
+    }
+  }
+  if (usetmpbuf) {
+    if ((_tmpbuf = (JSAMPLE *)MALLOC(sizeof(JSAMPLE) * tmpbufsize)) == NULL)
+      THROW("tjDecompressToYUVPlanes(): Memory allocation failure");
+    ptr = _tmpbuf;
+    for (i = 0; i < dinfo->num_components; i++) {
+      if ((tmpbuf[i] = (JSAMPROW *)malloc(sizeof(JSAMPROW) * th[i])) == NULL)
+        THROW("tjDecompressToYUVPlanes(): Memory allocation failure");
+      for (row = 0; row < th[i]; row++) {
+        tmpbuf[i][row] = ptr;
+        ptr += iw[i];
+      }
+    }
+  }
+
+  if (setjmp(this->jerr.setjmp_buffer)) {
+    /* If we get here, the JPEG code has signaled an error. */
+    retval = -1;  goto bailout;
+  }
+
+  if (flags & TJFLAG_FASTUPSAMPLE) dinfo->do_fancy_upsampling = FALSE;
+  if (flags & TJFLAG_FASTDCT) dinfo->dct_method = JDCT_FASTEST;
+  dinfo->raw_data_out = TRUE;
+
+  jpeg_start_decompress(dinfo);
+  for (row = 0; row < (int)dinfo->output_height;
+       row += dinfo->max_v_samp_factor * dinfo->_min_DCT_scaled_size) {
+    JSAMPARRAY yuvptr[MAX_COMPONENTS];
+    int crow[MAX_COMPONENTS];
+
+    for (i = 0; i < dinfo->num_components; i++) {
+      jpeg_component_info *compptr = &dinfo->comp_info[i];
+
+      if (jpegSubsamp == TJSAMP_420) {
+        /* When 4:2:0 subsampling is used with IDCT scaling, libjpeg will try
+           to be clever and use the IDCT to perform upsampling on the U and V
+           planes.  For instance, if the output image is to be scaled by 1/2
+           relative to the JPEG image, then the scaling factor and upsampling
+           effectively cancel each other, so a normal 8x8 IDCT can be used.
+           However, this is not desirable when using the decompress-to-YUV
+           functionality in TurboJPEG, since we want to output the U and V
+           planes in their subsampled form.  Thus, we have to override some
+           internal libjpeg parameters to force it to use the "scaled" IDCT
+           functions on the U and V planes. */
+        compptr->_DCT_scaled_size = dctsize;
+        compptr->MCU_sample_width = tjMCUWidth[jpegSubsamp] *
+          sf[sfi].num / sf[sfi].denom *
+          compptr->v_samp_factor / dinfo->max_v_samp_factor;
+        dinfo->idct->inverse_DCT[i] = dinfo->idct->inverse_DCT[0];
+      }
+      crow[i] = row * compptr->v_samp_factor / dinfo->max_v_samp_factor;
+      if (usetmpbuf) yuvptr[i] = tmpbuf[i];
+      else yuvptr[i] = &outbuf[i][crow[i]];
+    }
+    jpeg_read_raw_data(dinfo, yuvptr,
+                       dinfo->max_v_samp_factor * dinfo->_min_DCT_scaled_size);
+    if (usetmpbuf) {
+      int j;
+
+      for (i = 0; i < dinfo->num_components; i++) {
+        for (j = 0; j < MIN(th[i], ph[i] - crow[i]); j++) {
+          memcpy(outbuf[i][crow[i] + j], tmpbuf[i][j], pw[i]);
+        }
+      }
+    }
+  }
+  jpeg_finish_decompress(dinfo);
+
+bailout:
+  if (dinfo->global_state > DSTATE_START) jpeg_abort_decompress(dinfo);
+  for (i = 0; i < MAX_COMPONENTS; i++) {
+    free(tmpbuf[i]);
+    free(outbuf[i]);
+  }
+  free(_tmpbuf);
+  if (this->jerr.warning) retval = -1;
+  this->jerr.stopOnWarning = FALSE;
+  return retval;
+}
+
+/* TurboJPEG 1.4+ */
+DLLEXPORT int tjDecompressToYUV2(tjhandle handle, const unsigned char *jpegBuf,
+                                 unsigned long jpegSize, unsigned char *dstBuf,
+                                 int width, int align, int height, int flags)
+{
+  unsigned char *dstPlanes[3];
+  int pw0, ph0, strides[3], retval = -1, jpegSubsamp = -1;
+  int i, jpegwidth, jpegheight, scaledw, scaledh;
+
+  GET_DINSTANCE(handle);
+  this->jerr.stopOnWarning = (flags & TJFLAG_STOPONWARNING) ? TRUE : FALSE;
+
+  if (jpegBuf == NULL || jpegSize <= 0 || dstBuf == NULL || width < 0 ||
+      align < 1 || !IS_POW2(align) || height < 0)
+    THROW("tjDecompressToYUV2(): Invalid argument");
+
+  if (setjmp(this->jerr.setjmp_buffer)) {
+    /* If we get here, the JPEG code has signaled an error. */
+    return -1;
+  }
+
+  jpeg_mem_src_tj(dinfo, jpegBuf, jpegSize);
+  jpeg_read_header(dinfo, TRUE);
+  jpegSubsamp = getSubsamp(dinfo);
+  if (jpegSubsamp < 0)
+    THROW("tjDecompressToYUV2(): Could not determine subsampling type for JPEG image");
+
+  jpegwidth = dinfo->image_width;  jpegheight = dinfo->image_height;
+  if (width == 0) width = jpegwidth;
+  if (height == 0) height = jpegheight;
+  for (i = 0; i < NUMSF; i++) {
+    scaledw = TJSCALED(jpegwidth, sf[i]);
+    scaledh = TJSCALED(jpegheight, sf[i]);
+    if (scaledw <= width && scaledh <= height)
+      break;
+  }
+  if (i >= NUMSF)
+    THROW("tjDecompressToYUV2(): Could not scale down to desired image dimensions");
+
+  width = scaledw;  height = scaledh;
+
+  pw0 = tjPlaneWidth(0, width, jpegSubsamp);
+  ph0 = tjPlaneHeight(0, height, jpegSubsamp);
+  dstPlanes[0] = dstBuf;
+  strides[0] = PAD(pw0, align);
+  if (jpegSubsamp == TJSAMP_GRAY) {
+    strides[1] = strides[2] = 0;
+    dstPlanes[1] = dstPlanes[2] = NULL;
+  } else {
+    int pw1 = tjPlaneWidth(1, width, jpegSubsamp);
+    int ph1 = tjPlaneHeight(1, height, jpegSubsamp);
+
+    strides[1] = strides[2] = PAD(pw1, align);
+    if ((unsigned long long)strides[0] * (unsigned long long)ph0 >
+        (unsigned long long)INT_MAX ||
+        (unsigned long long)strides[1] * (unsigned long long)ph1 >
+        (unsigned long long)INT_MAX)
+      THROW("Image or row alignment is too large");
+    dstPlanes[1] = dstPlanes[0] + strides[0] * ph0;
+    dstPlanes[2] = dstPlanes[1] + strides[1] * ph1;
+  }
+
+  this->headerRead = 1;
+  return tjDecompressToYUVPlanes(handle, jpegBuf, jpegSize, dstPlanes, width,
+                                 strides, height, flags);
+
+bailout:
+  this->jerr.stopOnWarning = FALSE;
+  return retval;
+}
+
+/* TurboJPEG 1.1+ */
+DLLEXPORT int tjDecompressToYUV(tjhandle handle, unsigned char *jpegBuf,
+                                unsigned long jpegSize, unsigned char *dstBuf,
+                                int flags)
+{
+  return tjDecompressToYUV2(handle, jpegBuf, jpegSize, dstBuf, 0, 4, 0, flags);
+}
+
+
+/******************************** Transformer ********************************/
+
+/* TurboJPEG 1.2+ */
+DLLEXPORT tjhandle tjInitTransform(void)
+{
+  tjinstance *this = NULL;
+  tjhandle handle = NULL;
+
+  if ((this = (tjinstance *)malloc(sizeof(tjinstance))) == NULL) {
+    SNPRINTF(errStr, JMSG_LENGTH_MAX,
+             "tjInitTransform(): Memory allocation failure");
+    return NULL;
+  }
+  memset(this, 0, sizeof(tjinstance));
+  SNPRINTF(this->errStr, JMSG_LENGTH_MAX, "No error");
+  handle = _tjInitCompress(this);
+  if (!handle) return NULL;
+  handle = _tjInitDecompress(this);
+  return handle;
+}
+
+
+/* TurboJPEG 1.2+ */
+DLLEXPORT int tjTransform(tjhandle handle, const unsigned char *jpegBuf,
+                          unsigned long jpegSize, int n,
+                          unsigned char **dstBufs, unsigned long *dstSizes,
+                          tjtransform *t, int flags)
+{
+  jpeg_transform_info *xinfo = NULL;
+  jvirt_barray_ptr *srccoefs, *dstcoefs;
+  int retval = 0, i, saveMarkers = 0, srcSubsamp;
+  boolean alloc = TRUE;
+  struct my_progress_mgr progress;
+
+  GET_INSTANCE(handle);
+  this->jerr.stopOnWarning = (flags & TJFLAG_STOPONWARNING) ? TRUE : FALSE;
+  if ((this->init & COMPRESS) == 0 || (this->init & DECOMPRESS) == 0)
+    THROW("tjTransform(): Instance has not been initialized for transformation");
+
+  if (jpegBuf == NULL || jpegSize <= 0 || n < 1 || dstBufs == NULL ||
+      dstSizes == NULL || t == NULL || flags < 0)
+    THROW("tjTransform(): Invalid argument");
+
+#ifndef NO_PUTENV
+  if (flags & TJFLAG_FORCEMMX) PUTENV_S("JSIMD_FORCEMMX", "1");
+  else if (flags & TJFLAG_FORCESSE) PUTENV_S("JSIMD_FORCESSE", "1");
+  else if (flags & TJFLAG_FORCESSE2) PUTENV_S("JSIMD_FORCESSE2", "1");
+#endif
+
+  if (flags & TJFLAG_LIMITSCANS) {
+    memset(&progress, 0, sizeof(struct my_progress_mgr));
+    progress.pub.progress_monitor = my_progress_monitor;
+    progress.this = this;
+    dinfo->progress = &progress.pub;
+  } else
+    dinfo->progress = NULL;
+
+  if ((xinfo =
+       (jpeg_transform_info *)malloc(sizeof(jpeg_transform_info) * n)) == NULL)
+    THROW("tjTransform(): Memory allocation failure");
+  memset(xinfo, 0, sizeof(jpeg_transform_info) * n);
+
+  if (setjmp(this->jerr.setjmp_buffer)) {
+    /* If we get here, the JPEG code has signaled an error. */
+    retval = -1;  goto bailout;
+  }
+
+  jpeg_mem_src_tj(dinfo, jpegBuf, jpegSize);
+
+  for (i = 0; i < n; i++) {
+    if (t[i].op < 0 || t[i].op >= TJ_NUMXOP)
+      THROW("Invalid transform operation");
+    xinfo[i].transform = xformtypes[t[i].op];
+    xinfo[i].perfect = (t[i].options & TJXOPT_PERFECT) ? 1 : 0;
+    xinfo[i].trim = (t[i].options & TJXOPT_TRIM) ? 1 : 0;
+    xinfo[i].force_grayscale = (t[i].options & TJXOPT_GRAY) ? 1 : 0;
+    xinfo[i].crop = (t[i].options & TJXOPT_CROP) ? 1 : 0;
+    if (n != 1 && t[i].op == TJXOP_HFLIP) xinfo[i].slow_hflip = 1;
+    else xinfo[i].slow_hflip = 0;
+
+    if (xinfo[i].crop) {
+      if (t[i].r.x < 0 || t[i].r.y < 0 || t[i].r.w < 0 || t[i].r.h < 0)
+        THROW("Invalid cropping region");
+      xinfo[i].crop_xoffset = t[i].r.x;  xinfo[i].crop_xoffset_set = JCROP_POS;
+      xinfo[i].crop_yoffset = t[i].r.y;  xinfo[i].crop_yoffset_set = JCROP_POS;
+      if (t[i].r.w != 0) {
+        xinfo[i].crop_width = t[i].r.w;  xinfo[i].crop_width_set = JCROP_POS;
+      } else
+        xinfo[i].crop_width = JCROP_UNSET;
+      if (t[i].r.h != 0) {
+        xinfo[i].crop_height = t[i].r.h;  xinfo[i].crop_height_set = JCROP_POS;
+      } else
+        xinfo[i].crop_height = JCROP_UNSET;
+    }
+    if (!(t[i].options & TJXOPT_COPYNONE)) saveMarkers = 1;
+  }
+
+  jcopy_markers_setup(dinfo, saveMarkers ? JCOPYOPT_ALL : JCOPYOPT_NONE);
+  jpeg_read_header(dinfo, TRUE);
+  srcSubsamp = getSubsamp(dinfo);
+
+  for (i = 0; i < n; i++) {
+    if (!jtransform_request_workspace(dinfo, &xinfo[i]))
+      THROW("tjTransform(): Transform is not perfect");
+
+    if (xinfo[i].crop) {
+      int dstSubsamp = (t[i].options & TJXOPT_GRAY) ? TJSAMP_GRAY : srcSubsamp;
+
+      if (t[i].op == TJXOP_TRANSPOSE || t[i].op == TJXOP_TRANSVERSE ||
+          t[i].op == TJXOP_ROT90 || t[i].op == TJXOP_ROT270) {
+        if (dstSubsamp == TJSAMP_422) dstSubsamp = TJSAMP_440;
+        else if (dstSubsamp == TJSAMP_440) dstSubsamp = TJSAMP_422;
+        else if (dstSubsamp == TJSAMP_411) dstSubsamp = -1;
+      }
+      if (dstSubsamp < 0)
+        THROW("tjTransform(): Could not determine subsampling type for destination image");
+      if ((t[i].r.x % tjMCUWidth[dstSubsamp]) != 0 ||
+          (t[i].r.y % tjMCUHeight[dstSubsamp]) != 0) {
+        SNPRINTF(this->errStr, JMSG_LENGTH_MAX,
+                 "To crop this JPEG image, x must be a multiple of %d\n"
+                 "and y must be a multiple of %d.\n",
+                 tjMCUWidth[dstSubsamp], tjMCUHeight[dstSubsamp]);
+        this->isInstanceError = TRUE;
+        retval = -1;  goto bailout;
+      }
+    }
+  }
+
+  srccoefs = jpeg_read_coefficients(dinfo);
+
+  for (i = 0; i < n; i++) {
+    JDIMENSION dstWidth = dinfo->image_width, dstHeight = dinfo->image_height;
+
+    if (xinfo[i].crop) {
+      if ((JDIMENSION)t[i].r.x >= dstWidth ||
+          t[i].r.x + xinfo[i].crop_width > dstWidth ||
+          (JDIMENSION)t[i].r.y >= dstHeight ||
+          t[i].r.y + xinfo[i].crop_height > dstHeight)
+        THROW("The cropping region exceeds the destination image dimensions");
+      dstWidth = xinfo[i].crop_width;  dstHeight = xinfo[i].crop_height;
+    }
+
+    if (flags & TJFLAG_NOREALLOC) {
+      int dstSubsamp = (t[i].options & TJXOPT_GRAY) ? TJSAMP_GRAY : srcSubsamp;
+
+      if (t[i].op == TJXOP_TRANSPOSE || t[i].op == TJXOP_TRANSVERSE ||
+          t[i].op == TJXOP_ROT90 || t[i].op == TJXOP_ROT270) {
+        dstWidth = dinfo->image_height;  dstHeight = dinfo->image_width;
+        if (dstSubsamp == TJSAMP_422) dstSubsamp = TJSAMP_440;
+        else if (dstSubsamp == TJSAMP_440) dstSubsamp = TJSAMP_422;
+        else if (dstSubsamp == TJSAMP_411) dstSubsamp = -1;
+      }
+      if (dstSubsamp < 0)
+        THROW("tjTransform(): Could not determine subsampling type for destination image");
+      alloc = FALSE;  dstSizes[i] = tjBufSize(dstWidth, dstHeight, dstSubsamp);
+    }
+    if (!(t[i].options & TJXOPT_NOOUTPUT))
+      jpeg_mem_dest_tj(cinfo, &dstBufs[i], &dstSizes[i], alloc);
+    jpeg_copy_critical_parameters(dinfo, cinfo);
+    dstcoefs = jtransform_adjust_parameters(dinfo, cinfo, srccoefs, &xinfo[i]);
+#ifdef C_PROGRESSIVE_SUPPORTED
+    if (flags & TJFLAG_PROGRESSIVE || t[i].options & TJXOPT_PROGRESSIVE)
+      jpeg_simple_progression(cinfo);
+#endif
+    if (!(t[i].options & TJXOPT_NOOUTPUT)) {
+      jpeg_write_coefficients(cinfo, dstcoefs);
+      jcopy_markers_execute(dinfo, cinfo, t[i].options & TJXOPT_COPYNONE ?
+                                          JCOPYOPT_NONE : JCOPYOPT_ALL);
+    } else
+      jinit_c_master_control(cinfo, TRUE);
+    jtransform_execute_transformation(dinfo, cinfo, srccoefs, &xinfo[i]);
+    if (t[i].customFilter) {
+      int ci, y;
+      JDIMENSION by;
+
+      for (ci = 0; ci < cinfo->num_components; ci++) {
+        jpeg_component_info *compptr = &cinfo->comp_info[ci];
+        tjregion arrayRegion = { 0, 0, 0, 0 };
+        tjregion planeRegion = { 0, 0, 0, 0 };
+
+        arrayRegion.w = compptr->width_in_blocks * DCTSIZE;
+        arrayRegion.h = DCTSIZE;
+        planeRegion.w = compptr->width_in_blocks * DCTSIZE;
+        planeRegion.h = compptr->height_in_blocks * DCTSIZE;
+
+        for (by = 0; by < compptr->height_in_blocks;
+             by += compptr->v_samp_factor) {
+          JBLOCKARRAY barray = (dinfo->mem->access_virt_barray)
+            ((j_common_ptr)dinfo, dstcoefs[ci], by, compptr->v_samp_factor,
+             TRUE);
+
+          for (y = 0; y < compptr->v_samp_factor; y++) {
+            if (t[i].customFilter(barray[y][0], arrayRegion, planeRegion, ci,
+                                  i, &t[i]) == -1)
+              THROW("tjTransform(): Error in custom filter");
+            arrayRegion.y += DCTSIZE;
+          }
+        }
+      }
+    }
+    if (!(t[i].options & TJXOPT_NOOUTPUT)) jpeg_finish_compress(cinfo);
+  }
+
+  jpeg_finish_decompress(dinfo);
+
+bailout:
+  if (cinfo->global_state > CSTATE_START) {
+    if (alloc) (*cinfo->dest->term_destination) (cinfo);
+    jpeg_abort_compress(cinfo);
+  }
+  if (dinfo->global_state > DSTATE_START) jpeg_abort_decompress(dinfo);
+  free(xinfo);
+  if (this->jerr.warning) retval = -1;
+  this->jerr.stopOnWarning = FALSE;
+  return retval;
+}
+
+
+/*************************** Packed-Pixel Image I/O **************************/
+
+/* TurboJPEG 2.0+ */
+DLLEXPORT unsigned char *tjLoadImage(const char *filename, int *width,
+                                     int align, int *height, int *pixelFormat,
+                                     int flags)
+{
+  int retval = 0, tempc;
+  size_t pitch;
+  tjhandle handle = NULL;
+  tjinstance *this;
+  j_compress_ptr cinfo = NULL;
+  cjpeg_source_ptr src;
+  unsigned char *dstBuf = NULL;
+  FILE *file = NULL;
+  boolean invert;
+#ifndef JCS_EXTENSIONS
+  unsigned char *rgbBuf = NULL, *_dstBuf = NULL;
+  int _pitch = 0;
+#endif
+
+  if (!filename || !width || align < 1 || !height || !pixelFormat ||
+      *pixelFormat < TJPF_UNKNOWN || *pixelFormat >= TJ_NUMPF)
+    THROWG("tjLoadImage(): Invalid argument");
+  if ((align & (align - 1)) != 0)
+    THROWG("tjLoadImage(): Alignment must be a power of 2");
+
+#ifndef LIBJPEG_TURBO_VERSION
+  if (*pixelFormat == TJPF_CMYK)
+    THROWG("tjLoadImage(): TJPF_CMYK not implemented");
+#endif
+
+  if ((handle = tjInitCompress()) == NULL) return NULL;
+  this = (tjinstance *)handle;
+  cinfo = &this->cinfo;
+
+#ifdef _MSC_VER
+  if (fopen_s(&file, filename, "rb") || file == NULL)
+#else
+  if ((file = fopen(filename, "rb")) == NULL)
+#endif
+    THROW_UNIX("tjLoadImage(): Cannot open input file");
+
+  if ((tempc = getc(file)) < 0 || ungetc(tempc, file) == EOF)
+    THROW_UNIX("tjLoadImage(): Could not read input file")
+  else if (tempc == EOF)
+    THROWG("tjLoadImage(): Input file contains no data");
+
+  if (setjmp(this->jerr.setjmp_buffer)) {
+    /* If we get here, the JPEG code has signaled an error. */
+    retval = -1;  goto bailout;
+  }
+
+  if (*pixelFormat == TJPF_UNKNOWN) cinfo->in_color_space = JCS_UNKNOWN;
+  else cinfo->in_color_space = pf2cs[*pixelFormat];
+  if (tempc == 'B') {
+#ifdef LIBJPEG_TURBO_VERSION
+    if ((src = jinit_read_bmp(cinfo, FALSE)) == NULL)
+      THROWG("tjLoadImage(): Could not initialize bitmap loader");
+    invert = (flags & TJFLAG_BOTTOMUP) == 0;
+#else
+    if (*pixelFormat == TJPF_GRAY)
+      THROWG("tjLoadImage(): BMP --> Grayscale not implemented");
+    if ((src = jinit_read_bmp(cinfo)) == NULL)
+      THROWG("tjLoadImage(): Could not initialize bitmap loader");
+    invert = (flags & TJFLAG_BOTTOMUP) != 0;
+#endif
+  } else if (tempc == 'P') {
+    if ((src = jinit_read_ppm(cinfo)) == NULL)
+      THROWG("tjLoadImage(): Could not initialize PPM loader");
+    invert = (flags & TJFLAG_BOTTOMUP) != 0;
+  } else
+    THROWG("tjLoadImage(): Unsupported file type");
+
+  src->input_file = file;
+#ifdef FUZZING_BUILD_MODE_UNSAFE_FOR_PRODUCTION
+  /* Refuse to load images larger than 1 Megapixel when fuzzing. */
+  if (flags & TJFLAG_FUZZING)
+    src->max_pixels = 1048576;
+#endif
+  (*src->start_input) (cinfo, src);
+  (*cinfo->mem->realize_virt_arrays) ((j_common_ptr)cinfo);
+
+  *width = cinfo->image_width;  *height = cinfo->image_height;
+#ifdef LIBJPEG_TURBO_VERSION
+  *pixelFormat = cs2pf[cinfo->in_color_space];
+#else
+  if (*pixelFormat == TJPF_UNKNOWN) {
+    *pixelFormat = cs2pf[cinfo->in_color_space];
+    if (tempc == 'B' && *pixelFormat == TJPF_RGB)
+      *pixelFormat = TJPF_BGR;
+  }
+#endif
+
+  pitch = PAD((*width) * tjPixelSize[*pixelFormat], align);
+  if (
+#if ULLONG_MAX > SIZE_MAX
+      (unsigned long long)pitch * (unsigned long long)(*height) >
+      (unsigned long long)((size_t)-1) ||
+#endif
+      (dstBuf = (unsigned char *)malloc(pitch * (*height))) == NULL)
+    THROWG("tjLoadImage(): Memory allocation failure");
+
+  if (setjmp(this->jerr.setjmp_buffer)) {
+    /* If we get here, the JPEG code has signaled an error. */
+    retval = -1;  goto bailout;
+  }
+
+#ifndef JCS_EXTENSIONS
+  if (*pixelFormat != TJPF_GRAY && *pixelFormat != TJPF_CMYK &&
+      (tjRedOffset[*pixelFormat] != 0 || tjGreenOffset[*pixelFormat] != 1 ||
+       tjBlueOffset[*pixelFormat] != 2 || tjPixelSize[*pixelFormat] != 3)) {
+    rgbBuf = (unsigned char *)malloc((*width) * (*height) * 3);
+    if (!rgbBuf) THROW("tjLoadImage(): Memory allocation failure")
+    _pitch = pitch;  pitch = (*width) * 3;
+    _dstBuf = dstBuf;  dstBuf = rgbBuf;
+  }
+#endif
+
+  while (cinfo->next_scanline < cinfo->image_height) {
+    int i, nlines = (*src->get_pixel_rows) (cinfo, src);
+
+    for (i = 0; i < nlines; i++) {
+      unsigned char *dstptr;
+      int row;
+
+      row = cinfo->next_scanline + i;
+      if (invert) dstptr = &dstBuf[((*height) - row - 1) * pitch];
+      else dstptr = &dstBuf[row * pitch];
+#ifndef JCS_EXTENSIONS
+      if (dstBuf == rgbBuf)
+        memcpy(dstptr, src->buffer[i], (*width) * 3);
+      else
+#endif
+        memcpy(dstptr, src->buffer[i], (*width) * tjPixelSize[*pixelFormat]);
+    }
+    cinfo->next_scanline += nlines;
+  }
+
+  (*src->finish_input) (cinfo, src);
+
+#ifndef JCS_EXTENSIONS
+  if (dstBuf == rgbBuf) {
+    fromRGB(rgbBuf, 0, 1, 2, 3, _dstBuf, *width, _pitch, *height,
+            *pixelFormat);
+    dstBuf = _dstBuf;
+  }
+#endif
+
+bailout:
+  if (handle) tjDestroy(handle);
+  if (file) fclose(file);
+#ifndef JCS_EXTENSIONS
+  free(rgbBuf);
+#endif
+  if (retval < 0) { free(dstBuf);  dstBuf = NULL; }
+  return dstBuf;
+}
+
+
+/* TurboJPEG 2.0+ */
+DLLEXPORT int tjSaveImage(const char *filename, unsigned char *buffer,
+                          int width, int pitch, int height, int pixelFormat,
+                          int flags)
+{
+  int retval = 0;
+  tjhandle handle = NULL;
+  tjinstance *this;
+  j_decompress_ptr dinfo = NULL;
+  djpeg_dest_ptr dst;
+  FILE *file = NULL;
+  char *ptr = NULL;
+  boolean invert;
+#ifndef JCS_EXTENSIONS
+  unsigned char *rgbBuf = NULL;
+#endif
+
+  if (!filename || !buffer || width < 1 || pitch < 0 || height < 1 ||
+      pixelFormat < 0 || pixelFormat >= TJ_NUMPF)
+    THROWG("tjSaveImage(): Invalid argument");
+
+#ifndef LIBJPEG_TURBO_VERSION
+  if (pixelFormat == TJPF_CMYK)
+    THROWG("tjSaveImage(): TJPF_CMYK not implemented");
+#endif
+
+  if ((handle = tjInitDecompress()) == NULL)
+    return -1;
+  this = (tjinstance *)handle;
+  dinfo = &this->dinfo;
+
+#ifdef _MSC_VER
+  if (fopen_s(&file, filename, "wb") || file == NULL)
+#else
+  if ((file = fopen(filename, "wb")) == NULL)
+#endif
+    THROW_UNIX("tjSaveImage(): Cannot open output file");
+
+  if (setjmp(this->jerr.setjmp_buffer)) {
+    /* If we get here, the JPEG code has signaled an error. */
+    retval = -1;  goto bailout;
+  }
+
+#ifndef JCS_EXTENSIONS
+  if (pixelFormat != TJPF_GRAY &&
+      (tjRedOffset[pixelFormat] != 0 || tjGreenOffset[pixelFormat] != 1 ||
+       tjBlueOffset[pixelFormat] != 2 || tjPixelSize[pixelFormat] != 3)) {
+    rgbBuf = (unsigned char *)malloc(width * height * 3);
+    if (!rgbBuf) THROW("tjSaveImage(): Memory allocation failure");
+    buffer = toRGB(buffer, width, pitch, height, pixelFormat, rgbBuf, 0, 1, 2,
+                   3);
+    pitch = 0;
+    pixelFormat = TJPF_RGB;
+  }
+#endif
+
+  this->dinfo.out_color_space = pf2cs[pixelFormat];
+  dinfo->image_width = width;  dinfo->image_height = height;
+  dinfo->global_state = DSTATE_READY;
+  dinfo->scale_num = dinfo->scale_denom = 1;
+
+  ptr = strrchr(filename, '.');
+  if (ptr && !strcasecmp(ptr, ".bmp")) {
+#ifdef LIBJPEG_TURBO_VERSION
+    if ((dst = jinit_write_bmp(dinfo, FALSE, FALSE)) == NULL)
+      THROWG("tjSaveImage(): Could not initialize bitmap writer");
+    invert = (flags & TJFLAG_BOTTOMUP) == 0;
+#else
+    if ((dst = jinit_write_bmp(dinfo, FALSE)) == NULL)
+      THROWG("tjSaveImage(): Could not initialize bitmap writer");
+    invert = (flags & TJFLAG_BOTTOMUP) != 0;
+#endif
+  } else {
+    if ((dst = jinit_write_ppm(dinfo)) == NULL)
+      THROWG("tjSaveImage(): Could not initialize PPM writer");
+    invert = (flags & TJFLAG_BOTTOMUP) != 0;
+  }
+
+  dst->output_file = file;
+  (*dst->start_output) (dinfo, dst);
+  (*dinfo->mem->realize_virt_arrays) ((j_common_ptr)dinfo);
+
+  if (pitch == 0) pitch = width * tjPixelSize[pixelFormat];
+
+  while (dinfo->output_scanline < dinfo->output_height) {
+    unsigned char *rowptr;
+
+    if (invert)
+      rowptr = &buffer[(height - dinfo->output_scanline - 1) * pitch];
+    else
+      rowptr = &buffer[dinfo->output_scanline * pitch];
+
+    memcpy(dst->buffer[0], rowptr, width * tjPixelSize[pixelFormat]);
+    (*dst->put_pixel_rows) (dinfo, dst, 1);
+    dinfo->output_scanline++;
+  }
+
+  (*dst->finish_output) (dinfo, dst);
+
+bailout:
+  if (handle) tjDestroy(handle);
+  if (file) fclose(file);
+#ifndef JCS_EXTENSIONS
+  free(rgbBuf);
+#endif
+  return retval;
 }
