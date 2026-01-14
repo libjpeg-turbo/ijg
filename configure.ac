@@ -22,7 +22,7 @@ AC_CANONICAL_TARGET
 
 # Initialize Automake
 # Don't require all the GNU mandated files
-AM_INIT_AUTOMAKE([-Wall -Werror -Wno-obsolete no-dist foreign])
+AM_INIT_AUTOMAKE([-Wall -Werror -Wno-obsolete no-dist foreign subdir-objects])
 
 # Make --enable-silent-rules the default.
 # To get verbose build output you may configure
@@ -140,6 +140,7 @@ if test "$ijg_size_t_ok" != yes; then
       Try putting '"typedef unsigned int size_t;"' in jconfig.h.])
   fi
 fi
+AC_CHECK_SIZEOF(size_t)
 
 # Check compiler characteristics
 AC_MSG_CHECKING([for type unsigned char])
