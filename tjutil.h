@@ -1,5 +1,6 @@
 /*
- * Copyright (C)2011 D. R. Commander.  All Rights Reserved.
+ * Copyright (C)2011, 2022-2023 D. R. Commander.  All Rights Reserved.
+ * Copyright (C)2021 Alex Richardson.  All Rights Reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are met:
@@ -26,22 +27,146 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include <string.h>
+#define JPEG_INTERNALS
+#include "jconfig.h"
+
 #ifdef _WIN32
-	#ifndef __MINGW32__
-		#include <stdio.h>
-		#define snprintf(str, n, format, ...)  \
-			_snprintf_s(str, n, _TRUNCATE, format, __VA_ARGS__)
-	#endif
-	#define strcasecmp stricmp
-	#define strncasecmp strnicmp
+#ifndef strcasecmp
+#define strcasecmp  stricmp
+#endif
+#ifndef strncasecmp
+#define strncasecmp  strnicmp
+#endif
 #endif
 
+
+/* JUINTPTR must hold pointer values. */
+#ifdef __UINTPTR_TYPE__
+/*
+ * __UINTPTR_TYPE__ is GNU-specific and available in GCC 4.6+ and Clang 3.0+.
+ * Fortunately, that is sufficient to support the few architectures for which
+ * sizeof(void *) != sizeof(size_t).  The only other options would require C99
+ * or Clang-specific builtins.
+ */
+typedef __UINTPTR_TYPE__ JUINTPTR;
+#else
+typedef size_t JUINTPTR;
+#endif
+
+
+/*
+ * These macros/inline functions facilitate using Microsoft's "safe string"
+ * functions with Visual Studio builds without the need to scatter #ifdefs
+ * throughout the code base.
+ */
+
+
+#ifdef _MSC_VER
+
+#define SNPRINTF(str, n, format, ...) \
+  _snprintf_s(str, n, _TRUNCATE, format, ##__VA_ARGS__)
+
+#else
+
+#define SNPRINTF  snprintf
+
+#endif
+
+
+#ifndef NO_GETENV
+
+#ifdef _MSC_VER
+
+static INLINE int GETENV_S(char *buffer, size_t buffer_size, const char *name)
+{
+  size_t required_size;
+
+  return (int)getenv_s(&required_size, buffer, buffer_size, name);
+}
+
+#else /* _MSC_VER */
+
+#include <errno.h>
+
+/* This provides a similar interface to the Microsoft/C11 getenv_s() function,
+ * but other than parameter validation, it has no advantages over getenv().
+ */
+
+static INLINE int GETENV_S(char *buffer, size_t buffer_size, const char *name)
+{
+  char *env;
+
+  if (!buffer) {
+    if (buffer_size == 0)
+      return 0;
+    else
+      return (errno = EINVAL);
+  }
+  if (buffer_size == 0)
+    return (errno = EINVAL);
+  if (!name) {
+    *buffer = 0;
+    return 0;
+  }
+
+  env = getenv(name);
+  if (!env)
+  {
+    *buffer = 0;
+    return 0;
+  }
+
+  if (strlen(env) + 1 > buffer_size) {
+    *buffer = 0;
+    return ERANGE;
+  }
+
+  strncpy(buffer, env, buffer_size);
+
+  return 0;
+}
+
+#endif /* _MSC_VER */
+
+#endif /* NO_GETENV */
+
+
+#ifndef NO_PUTENV
+
+#ifdef _WIN32
+
+#define PUTENV_S(name, value)  _putenv_s(name, value)
+
+#else
+
+#include <errno.h>
+
+/* This provides a similar interface to the Microsoft _putenv_s() function, but
+ * other than parameter validation, it has no advantages over setenv().
+ */
+
+static INLINE int PUTENV_S(const char *name, const char *value)
+{
+  if (!name || !value)
+    return (errno = EINVAL);
+
+  setenv(name, value, 1);
+
+  return errno;
+}
+
+#endif /* _WIN32 */
+
+#endif /* NO_PUTENV */
+
+
 #ifndef min
- #define min(a,b) ((a)<(b)?(a):(b))
+#define min(a, b)  ((a) < (b) ? (a) : (b))
 #endif
 
 #ifndef max
- #define max(a,b) ((a)>(b)?(a):(b))
+#define max(a, b)  ((a) > (b) ? (a) : (b))
 #endif
 
-extern double gettime(void);
+extern double getTime(void);
