@@ -75,7 +75,8 @@ if HAVE_LD_VERSION_SCRIPT
 endif
 
 libturbojpeg_la_SOURCES = $(libjpeg_la_SOURCES) turbojpeg.c turbojpeg.h \
-        transupp-tj.c transupp-tj.h jdatadst-tj.c jdatasrc-tj.c
+        transupp-tj.c transupp-tj.h jdatadst-tj.c jdatasrc-tj.c rdbmp.c \
+        rdppm.c wrbmp.c wrppm.c
 
 libturbojpeg_la_LDFLAGS = -version-info 0:0 -no-undefined
 
@@ -86,21 +87,22 @@ endif
 # Executables to build
 bin_PROGRAMS = cjpeg djpeg jpegtran rdjpgcom wrjpgcom tjbench tjunittest
 
-tjbench_SOURCES = tjbench.c bmp.h bmp.c tjutil.h tjutil.c rdbmp.c rdppm.c \
-        wrbmp.c wrppm.c
+tjbench_SOURCES = tjbench.c tjutil.h tjutil.c
 
 tjbench_LDADD   = libturbojpeg.la libjpeg.la -lm
 
-tjunittest_SOURCES = tjunittest.c tjutil.h tjutil.c
+tjunittest_SOURCES = tjunittest.c tjutil.h tjutil.c md5/md5.c md5/md5hl.c
 
 tjunittest_LDADD = libturbojpeg.la
 
 # Executable sources & libs
 cjpeg_SOURCES    = cjpeg.c rdppm.c rdgif.c rdtarga.c rdrle.c rdbmp.c \
         rdswitch.c cdjpeg.c
+cjpeg_CFLAGS = $(AM_CFLAGS)
 cjpeg_LDADD      = libjpeg.la
 djpeg_SOURCES    = djpeg.c wrppm.c wrgif.c wrtarga.c wrrle.c wrbmp.c \
         rdcolmap.c cdjpeg.c
+djpeg_CFLAGS = $(AM_CFLAGS)
 djpeg_LDADD      = libjpeg.la
 jpegtran_SOURCES = jpegtran.c rdswitch.c cdjpeg.c transupp.c
 jpegtran_LDADD   = libjpeg.la
@@ -139,6 +141,7 @@ check-local:
 	$(RM) testout* test_enc*
 	./tjunittest
 	./tjunittest -alloc
+	./tjunittest -bmp
 	./djpeg -dct int -ppm -outfile testout.ppm  $(srcdir)/testorig.jpg
 	./djpeg -dct int -bmp -colors 256 -outfile testout.bmp  $(srcdir)/testorig.jpg
 	./cjpeg -dct int -outfile testout.jpg  $(srcdir)/testimg.ppm
